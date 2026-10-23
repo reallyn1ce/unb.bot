@@ -8,6 +8,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
+from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -235,12 +236,38 @@ class EconomyBot(commands.Bot):
         self.settings = None
         self.ai = AIHandler()
         self.chart_lock = asyncio.Lock()
+        self._web_runner = None
         self.chart_files = {
             "all": "/tmp/cb_economy_all.png",
             "24h": "/tmp/cb_economy_24h.png",
         }
 
+    async def close(self):
+        try:
+            await self.ai.close()
+        except Exception:
+            log.exception("Ошибка закрытия AI-сессии")
+        if self._web_runner is not None:
+            await self._web_runner.cleanup()
+            self._web_runner = None
+        if self.mongo is not None:
+            self.mongo.close()
+            self.mongo = None
+        await super().close()
+
     async def setup_hook(self):
+        # Render Web Service requires an HTTP listener on the assigned PORT.
+        app = web.Application()
+        async def health(request):
+            return web.json_response({"status": "ok", "service": "discord-economy-bot"})
+        app.router.add_get("/", health)
+        app.router.add_get("/health", health)
+        self._web_runner = web.AppRunner(app)
+        await self._web_runner.setup()
+        site = web.TCPSite(self._web_runner, "0.0.0.0", PORT)
+        await site.start()
+        log.info("HTTP health server listening on port %s", PORT)
+
         self.mongo = AsyncIOMotorClient(mongo_uri(), serverSelectionTimeoutMS=10000)
         await self.mongo.admin.command("ping")
         self.db = self.mongo[MONGO_DB_NAME]
