@@ -21,7 +21,7 @@ BOT_VERSION = "5.0.0"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_USER = os.getenv("MONGO_USER")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "cb")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "economy_bot")
 PORT = int(os.getenv("PORT", "10000"))
 
 # --- Экономика ---------------------------------------------------------------
@@ -91,7 +91,7 @@ def fmt_duration(seconds):
 def mongo_uri():
     user = urllib.parse.quote_plus(MONGO_USER or "")
     password = urllib.parse.quote_plus(MONGO_PASSWORD or "")
-    return f"mongodb+srv://{user}:{password}@cluster0.u62aem5.mongodb.net/?appName=CentralBank"
+    return f"mongodb+srv://{user}:{password}@eco.lphalvu.mongodb.net/?retryWrites=true&w=majority&appName=CentralBank"
 
 
 def check_env():
@@ -226,7 +226,7 @@ class EconomyBot(commands.Bot):
         )
         self.mongo = None
         self.db = None
-        self.users = None
+        self.db_users = None
         self.businesses = None
         self.economy = None
         self.tx = None
@@ -244,7 +244,7 @@ class EconomyBot(commands.Bot):
         self.mongo = AsyncIOMotorClient(mongo_uri(), serverSelectionTimeoutMS=10000)
         await self.mongo.admin.command("ping")
         self.db = self.mongo[MONGO_DB_NAME]
-        self.users = self.db.users
+        self.db_users = self.db.users
         self.businesses = self.db.businesses
         self.economy = self.db.economy
         self.tx = self.db.transactions
@@ -254,8 +254,8 @@ class EconomyBot(commands.Bot):
 
         await self.history.create_index("created_at")
         await self.tx.create_index("created_at")
-        await self.users.create_index("cash")
-        await self.users.create_index("bank")
+        await self.db_users.create_index("cash")
+        await self.db_users.create_index("bank")
         await self.economy.update_one(
             {"_id": "central_bank"},
             {"$setOnInsert": {"reserve": 0, "printed": 0, "created_at": now()},
@@ -310,12 +310,12 @@ class EconomyBot(commands.Bot):
 
     # --- Работа с БД ---------------------------------------------------------
     async def ensure_user(self, user_id: int, *, session=None):
-        await self.users.update_one(
+        await self.db_users.update_one(
             {"_id": int(user_id)},
             {"$setOnInsert": {"cash": 0, "bank": 0, "debt": 0, "last_work": None, "created_at": now()}},
             upsert=True, session=session,
         )
-        return await self.users.find_one({"_id": int(user_id)}, session=session)
+        return await self.db_users.find_one({"_id": int(user_id)}, session=session)
 
     async def get_balance(self, user_id: int):
         return await self.ensure_user(user_id)
@@ -325,13 +325,13 @@ class EconomyBot(commands.Bot):
         delta = int(delta)
         await self.ensure_user(user_id, session=session)
         if delta < 0:
-            result = await self.users.update_one(
+            result = await self.db_users.update_one(
                 {"_id": int(user_id), "cash": {"$gte": -delta}},
                 {"$inc": {"cash": delta}, "$set": {"updated_at": now()}},
                 session=session,
             )
         else:
-            result = await self.users.update_one(
+            result = await self.db_users.update_one(
                 {"_id": int(user_id)},
                 {"$inc": {"cash": delta}, "$set": {"updated_at": now()}},
                 session=session,
@@ -342,13 +342,13 @@ class EconomyBot(commands.Bot):
         delta = int(delta)
         await self.ensure_user(user_id, session=session)
         if delta < 0:
-            result = await self.users.update_one(
+            result = await self.db_users.update_one(
                 {"_id": int(user_id), "bank": {"$gte": -delta}},
                 {"$inc": {"bank": delta}, "$set": {"updated_at": now()}},
                 session=session,
             )
         else:
-            result = await self.users.update_one(
+            result = await self.db_users.update_one(
                 {"_id": int(user_id)},
                 {"$inc": {"bank": delta}, "$set": {"updated_at": now()}},
                 session=session,
@@ -372,19 +372,19 @@ class EconomyBot(commands.Bot):
             # MongoDB transactions require a replica set/sharded cluster (Atlas supports this).
             async with await self.mongo.start_session() as session:
                 async with session.start_transaction():
-                    sender = await self.users.find_one({"_id": sender_id}, session=session)
+                    sender = await self.db_users.find_one({"_id": sender_id}, session=session)
                     if int(sender.get("debt", 0)) > 0:
                         raise EconomyError("У тебя есть долг. Погаси его перед переводами.")
                     if int(sender.get("cash", 0)) < amount:
                         raise EconomyError("Недостаточно наличных.")
-                    debited = await self.users.update_one(
+                    debited = await self.db_users.update_one(
                         {"_id": sender_id, "cash": {"$gte": amount}, "debt": 0},
                         {"$inc": {"cash": -amount}, "$set": {"updated_at": now()}},
                         session=session,
                     )
                     if debited.modified_count != 1:
                         raise EconomyError("Перевод отклонён: проверь баланс и долг.")
-                    await self.users.update_one(
+                    await self.db_users.update_one(
                         {"_id": recipient_id},
                         {"$inc": {"cash": amount}, "$set": {"updated_at": now()}},
                         session=session,
@@ -413,7 +413,7 @@ class EconomyBot(commands.Bot):
         await self.journal("taxpayer", "fund_state_budget", amount, reason, session=session)
 
     async def _pay_earning_tx(self, session, user_id, gross, tax, net, reason, account):
-        await self.users.update_one(
+        await self.db_users.update_one(
             {"_id": user_id},
             {"$inc": {account: net}, "$set": {"updated_at": now()}},
             session=session,
@@ -465,7 +465,7 @@ class EconomyBot(commands.Bot):
         budget = await self.fund_balance("state_budget")
         fund_rows = await self.funds.aggregate([{"$group": {"_id": None, "total": {"$sum": "$balance"}}}]).to_list(1)
         funds_total = int(fund_rows[0]["total"]) if fund_rows else 0
-        players_rows = await self.users.aggregate([{"$group": {"_id": None, "cash": {"$sum": "$cash"}, "bank": {"$sum": "$bank"}, "debt": {"$sum": "$debt"}}}]).to_list(1)
+        players_rows = await self.db_users.aggregate([{"$group": {"_id": None, "cash": {"$sum": "$cash"}, "bank": {"$sum": "$bank"}, "debt": {"$sum": "$debt"}}}]).to_list(1)
         p = players_rows[0] if players_rows else {}
         players = int(p.get("cash", 0)) + int(p.get("bank", 0))
         player_debt = int(p.get("debt", 0))
@@ -562,7 +562,7 @@ class EconomyBot(commands.Bot):
                     async with session.start_transaction():
                         await self.ensure_user(uid, session=session)
                         # Налог на имущество списывается с наличных. Нет наличных — бизнес замораживается.
-                        debit = await self.users.update_one(
+                        debit = await self.db_users.update_one(
                             {"_id": uid, "cash": {"$gte": tax}},
                             {"$inc": {"cash": -tax, "bank": income}, "$set": {"updated_at": current}},
                             session=session,
@@ -722,7 +722,7 @@ class EconomyCog(commands.Cog):
                 async with session.start_transaction():
                     # Атомарная проверка кулдауна: фильтр пропускает только тех, у кого
                     # last_work пуст/отсутствует или старше 4 часов. Гонка двух команд невозможна.
-                    claimed = await self.bot.users.update_one(
+                    claimed = await self.bot.db_users.update_one(
                         {"_id": uid, "$or": [{"last_work": None}, {"last_work": {"$lte": threshold}}]},
                         {"$set": {"last_work": current, "updated_at": current}},
                         session=session,
@@ -732,7 +732,7 @@ class EconomyCog(commands.Cog):
                     _, tax, net = await self.bot.pay_earning(
                         uid, gross, "Зарплата за работу", session=session)
         except EconomyError:
-            doc = await self.bot.users.find_one({"_id": uid}) or {}
+            doc = await self.bot.db_users.find_one({"_id": uid}) or {}
             last = as_utc(doc.get("last_work")) or current
             remaining = WORK_COOLDOWN - (now() - last).total_seconds()
             return await safe_send(
@@ -746,7 +746,7 @@ class EconomyCog(commands.Cog):
 
     @commands.hybrid_command(name="top", description="Топ-10 богатейших игроков")
     async def top(self, ctx):
-        rows = await self.bot.users.aggregate([
+        rows = await self.bot.db_users.aggregate([
             {"$addFields": {"net": {"$subtract": [
                 {"$add": [{"$ifNull": ["$cash", 0]}, {"$ifNull": ["$bank", 0]}]},
                 {"$ifNull": ["$debt", 0]}]}}},
@@ -801,7 +801,7 @@ class EconomyCog(commands.Cog):
         try:
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
-                    result = await self.bot.users.update_one(
+                    result = await self.bot.db_users.update_one(
                         {"_id": uid, "cash": {"$gte": BUSINESS_COST}, "debt": 0},
                         {"$inc": {"cash": -BUSINESS_COST}, "$set": {"updated_at": now()}},
                         session=session,
@@ -885,7 +885,7 @@ class EconomyCog(commands.Cog):
                 async with session.start_transaction():
                     if not await self.bot.change_reserve(-amount, session=session):
                         raise EconomyError("В резерве ЦБ недостаточно средств.")
-                    taken = await self.bot.users.update_one(
+                    taken = await self.bot.db_users.update_one(
                         {"_id": uid, "debt": 0},
                         {"$inc": {"cash": amount, "debt": owed}, "$set": {"updated_at": now()}},
                         session=session,
@@ -913,7 +913,7 @@ class EconomyCog(commands.Cog):
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
                     # Условный апдейт: ни cash, ни debt не могут уйти в минус.
-                    result = await self.bot.users.update_one(
+                    result = await self.bot.db_users.update_one(
                         {"_id": uid, "cash": {"$gte": payment}, "debt": {"$gte": payment}},
                         {"$inc": {"cash": -payment, "debt": -payment}, "$set": {"updated_at": now()}},
                         session=session,
@@ -1162,7 +1162,7 @@ class CasinoCog(commands.Cog):
     async def take_bet(self, uid: int, bet: int, game: str, *, max_payout: int, session):
         """Списывает ставку с cash в резерв ЦБ. Отказывает, если резерв (вместе со ставкой)
         не покроет максимально возможную выплату."""
-        debit = await self.bot.users.update_one(
+        debit = await self.bot.db_users.update_one(
             {"_id": uid, "cash": {"$gte": bet}},
             {"$inc": {"cash": -bet}, "$set": {"updated_at": now()}},
             session=session,
