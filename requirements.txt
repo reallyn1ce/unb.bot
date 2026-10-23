@@ -1,8 +1,5 @@
 discord.py
 motor
-huggingface_hub
-requests
-matplotlib
-flask
-waitress
 aiohttp
+matplotlib
+pymongo
