@@ -1,10 +1,6 @@
 # =============================================================================
-# bot_economy_v6_0.py — мультисерверная версия
-# Изменения:
-#   - users привязаны к (guild_id, user_id), составной уникальный индекс
-#   - настройки в guild_settings, пресеты light/standard/hardcore/custom
-#   - все команды читают параметры из БД
-#   - фиксы: active_bj персистентность, TTL истории, точное время отчёта
+# bot_economy_v6_0_1.py — мультисерверная версия с безопасным созданием индексов
+# Fix: IndexOptionsConflict (код 85) — автоматическое пересоздание TTL-индексов
 # =============================================================================
 import os
 import json
@@ -22,12 +18,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import OperationFailure
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-BOT_VERSION = "6.0.0"
+BOT_VERSION = "6.0.1"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_USER = os.getenv("MONGO_USER")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
@@ -205,6 +202,43 @@ def upgrade_cost(level):
     return BUSINESS_UPGRADE_BASE_COST * max(1, int(level))
 
 
+async def safe_create_index(collection, keys, *, name=None, **options):
+    """
+    Безопасно создаёт индекс. Если индекс с таким именем уже существует,
+    но с другими опциями (например, добавлен/изменён TTL) — пересоздаёт его.
+    Работает для TTL и любого другого конфликта опций (код 85).
+    """
+    # Motor принимает list of (key, direction) для составных, строку для одиночных
+    if isinstance(keys, str):
+        key_spec = keys
+        default_name = f"{keys}_1"
+    elif isinstance(keys, (list, tuple)) and keys and isinstance(keys[0], tuple):
+        key_spec = keys
+        default_name = "_".join(f"{k}_{d}" for k, d in keys)
+    else:
+        key_spec = keys
+        default_name = None
+
+    index_name = name or default_name
+
+    try:
+        return await collection.create_index(key_spec, name=index_name, **options)
+    except OperationFailure as e:
+        if e.code != 85:  # IndexOptionsConflict
+            raise
+        log.warning("Индекс %s уже существует с другими опциями — пересоздаю", index_name)
+        # Пытаемся удалить по имени, если не вышло — по ключу
+        try:
+            await collection.drop_index(index_name)
+        except OperationFailure:
+            try:
+                await collection.drop_index(key_spec)
+            except OperationFailure:
+                log.exception("Не удалось удалить старый индекс %s", index_name)
+                raise
+        return await collection.create_index(key_spec, name=index_name, **options)
+
+
 async def safe_send(target, *args, **kwargs):
     try:
         return await target.send(*args, **kwargs)
@@ -227,9 +261,6 @@ intents.message_content = True
 # Настройки гильдии (поверх guild_settings)
 # =============================================================================
 class GuildSettings:
-    """Обёртка над документом guild_settings. Все параметры команд берутся отсюда.
-    Если поля нет в БД — берётся из DEFAULT_PRESET."""
-
     def __init__(self, bot, guild_id: int, doc: Optional[dict] = None):
         self.bot = bot
         self.guild_id = int(guild_id)
@@ -241,14 +272,12 @@ class GuildSettings:
         return PRESETS.get(self.preset, PRESETS[DEFAULT_PRESET])
 
     def get(self, key, fallback=None):
-        # Явно сохранённое значение важнее пресета
         if key in self.doc and not isinstance(self.doc[key], bool):
             return self.doc[key]
         if key in self._defaults:
             return self._defaults[key]
         return fallback
 
-    # Удобные геттеры
     @property
     def tax_rate(self) -> float:
         return float(self.get("tax_rate"))
@@ -383,7 +412,7 @@ class EconomyBot(commands.Bot):
         self.history = None
         self.settings = None
         self.casino_stats = None
-        self.casino_active = None   # активные партии блэкджека (персистентно)
+        self.casino_active = None
         self.ai = AIHandler()
         self.chart_lock = asyncio.Lock()
         self._web_runner = None
@@ -419,21 +448,37 @@ class EconomyBot(commands.Bot):
         self.casino_stats = self.db.casino_stats
         self.casino_active = self.db.casino_active
 
-        # --- ИНДЕКСЫ ---
-        # Главное изменение: составной уникальный индекс по (guild_id, user_id)
-        await self.db_users.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
-        await self.db_users.create_index([("guild_id", 1), ("cash", -1)])
-        await self.db_users.create_index([("guild_id", 1), ("bank", -1)])
-        # Бизнесы тоже разделяем по гильдиям
-        await self.businesses.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
-        # Казино-статистика по гильдиям
-        await self.casino_stats.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
-        # Активные партии блэкджека (TTL: если бот упал, запись сама исчезнет через час)
-        await self.casino_active.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
-        await self.casino_active.create_index("created_at", expireAfterSeconds=3600)
-        # История с TTL 30 дней — фикс разрастания
-        await self.history.create_index("created_at", expireAfterSeconds=HISTORY_TTL_DAYS * 86400)
-        await self.tx.create_index("created_at")
+        # --- ИНДЕКСЫ (безопасное создание) ---
+        # users: составной уникальный (guild_id, user_id)
+        await safe_create_index(
+            self.db_users, [("guild_id", 1), ("user_id", 1)], unique=True
+        )
+        await safe_create_index(self.db_users, [("guild_id", 1), ("cash", -1)])
+        await safe_create_index(self.db_users, [("guild_id", 1), ("bank", -1)])
+
+        # businesses: составной уникальный
+        await safe_create_index(
+            self.businesses, [("guild_id", 1), ("user_id", 1)], unique=True
+        )
+
+        # casino_stats: составной уникальный
+        await safe_create_index(
+            self.casino_stats, [("guild_id", 1), ("user_id", 1)], unique=True
+        )
+
+        # casino_active: активные партии блэкджека + TTL 1 час
+        await safe_create_index(
+            self.casino_active, [("guild_id", 1), ("user_id", 1)], unique=True
+        )
+        await safe_create_index(
+            self.casino_active, "created_at", expireAfterSeconds=3600
+        )
+
+        # история: TTL 30 дней — с обработкой конфликта старых индексов
+        await safe_create_index(
+            self.history, "created_at", expireAfterSeconds=HISTORY_TTL_DAYS * 86400
+        )
+        await safe_create_index(self.tx, "created_at")
 
         await self.economy.update_one(
             {"_id": "central_bank"},
@@ -521,7 +566,6 @@ class EconomyBot(commands.Bot):
 
     # --- Работа с пользователями (мультисерверная) ---------------------------
     async def ensure_user(self, guild_id: int, user_id: int, *, session=None):
-        """Создаёт документ пользователя для конкретной гильдии."""
         await self.db_users.update_one(
             {"guild_id": int(guild_id), "user_id": int(user_id)},
             {"$setOnInsert": {
@@ -693,8 +737,6 @@ class EconomyBot(commands.Bot):
         return result.modified_count == 1
 
     async def stats(self, guild_id: Optional[int] = None):
-        """Если guild_id задан — статистика игроков этой гильдии.
-        Резерв ЦБ и госбюджет всегда глобальные."""
         reserve = await self.reserve()
         budget = await self.fund_balance("state_budget")
         fund_rows = await self.funds.aggregate(
@@ -741,7 +783,7 @@ class EconomyBot(commands.Bot):
         }
 
     async def snapshot(self):
-        stats = await self.stats()  # глобальная
+        stats = await self.stats()
         await self.history.insert_one({
             "created_at": now(), **stats,
             "state_budget": stats["budget"],
@@ -913,7 +955,6 @@ class EconomyBot(commands.Bot):
 
     @tasks.loop(minutes=5)
     async def daily_report_loop(self):
-        """Точный расчёт: отчёт отправляется один раз в день в час из guild_settings."""
         current = now()
         async for config in self.settings.find({"$or": [
             {"report_channel_id": {"$exists": True}},
@@ -960,6 +1001,8 @@ class EconomyBot(commands.Bot):
     @daily_report_loop.before_loop
     async def before_daily_report_loop(self):
         await self.wait_until_ready()
+
+
 # =============================================================================
 # SettingsCog — панель настроек /settings с пресетами
 # =============================================================================
@@ -1046,7 +1089,7 @@ class CustomSettingsModal(discord.ui.Modal, title="Кастомные настр
             upsert=True,
         )
         settings = await self.bot.get_guild_settings(self.guild_id)
-        embed = DiscordSettingsView.build_embed(settings, "custom")
+        embed = SettingsView.build_embed(settings, "custom")
         await interaction.response.send_message("✅ Кастомные настройки сохранены.", ephemeral=True)
 
 
@@ -1115,8 +1158,7 @@ class SettingsCog(commands.Cog):
     @app_commands.guild_only()
     async def settings_cmd(self, interaction: discord.Interaction):
         settings = await self.bot.get_guild_settings(interaction.guild.id)
-        preset_name = settings.preset
-        embed = self.build_embed(settings, preset_name)
+        embed = self.build_embed(settings, settings.preset)
         view = SettingsView(self, interaction.guild.id)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
@@ -2027,8 +2069,6 @@ class BlackjackView(CasinoView):
 
 
 class CasinoCog(commands.Cog):
-    """Ставки идут в глобальный резерв ЦБ, но статистика — по гильдиям."""
-
     def __init__(self, bot: EconomyBot):
         self.bot = bot
 
@@ -2042,9 +2082,7 @@ class CasinoCog(commands.Cog):
 
     async def precheck(self, guild_id: int, uid: int, bet: int):
         if bet < CASINO_MIN_BET or bet > CASINO_MAX_BET:
-            raise EconomyError(
-                f"Ставка от {fmt(CASINO_MIN_BET)} до {fmt(CASINO_MAX_BET)}."
-            )
+            raise EconomyError(f"Ставка от {fmt(CASINO_MIN_BET)} до {fmt(CASINO_MAX_BET)}.")
         user = await self.bot.ensure_user(guild_id, uid)
         cash = int(user.get("cash", 0))
         if cash < bet:
@@ -2320,7 +2358,7 @@ class CasinoCog(commands.Cog):
 
 
 # =============================================================================
-# AICog (без изменений по логике, только guild_id в stats)
+# AICog
 # =============================================================================
 class AICog(commands.Cog):
     def __init__(self, bot: EconomyBot):
