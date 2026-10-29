@@ -1,16 +1,14 @@
-# =============================================================================
-# bot_economy_v6_0_1.py — мультисерверная версия с безопасным созданием индексов
-# Fix: IndexOptionsConflict (код 85) — автоматическое пересоздание TTL-индексов
-# =============================================================================
 import os
 import json
 import asyncio
 import logging
 import urllib.parse
 import random
+import re
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Optional
+from typing import Literal
 
 import aiohttp
 from aiohttp import web
@@ -18,7 +16,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import OperationFailure
+from pymongo.errors import DuplicateKeyError, OperationFailure
 
 import matplotlib
 matplotlib.use("Agg")
@@ -31,89 +29,125 @@ MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "economy_bot")
 PORT = int(os.getenv("PORT", "10000"))
 
-# --- Глобальные (не гильдейские) константы -----------------------------------
+# --- Экономика ---------------------------------------------------------------
+# Всё, что зависит от сервера (кулдауны, шансы, налоги, зарплата, кредит), хранится
+# в guild_settings.eco и описано в PRESETS ниже. Здесь — только то, что не настраивается.
 LOAN_MIN, LOAN_MAX = 100, 1_000_000
+LOAN_TERM = 3 * 24 * 3600               # срок кредита; после него начисляется штраф за просрочку
 REPORT_HOUR_UTC = 18
+COOLDOWN_MAX = 7 * 24 * 3600            # верхняя граница кулдауна
+
+# --- Криминал ----------------------------------------------------------------
+CRIME_REWARD = (300, 900)               # награда за !crime (из резерва ЦБ, без НДФЛ)
+SLUT_REWARD = (200, 700)                # награда за !slut (из резерва ЦБ, без НДФЛ)
+CRIME_FINE_RATE = 0.20                  # штраф: 20% от (наличные + банк)...
+CRIME_FINE_MAX = 500                    # ...но не больше 500; уходит в госбюджет
+ROB_LOOT_RATE = (0.10, 0.30)            # доля наличных жертвы, которую можно украсть
+ROB_MAX_LOOT = 5_000
+ROB_MIN_TARGET_CASH = 500               # у жертвы должно быть хотя бы столько наличных
+ROB_FINE_RATE = 0.25                    # при провале вор платит жертве 25% своих наличных...
+ROB_FINE_MAX = 1_000                    # ...но не больше 1000
+ROB_VICTIM_PROTECTION = 3600            # после успешного ограбления жертву час нельзя грабить
+
+# --- Бизнес ------------------------------------------------------------------
+BUSINESS_COST = 50_000
+BUSINESS_HOURLY_INCOME = 1_000          # доход 1-го уровня
+BUSINESS_INCOME_PER_LEVEL = 500         # +500/час за каждый следующий уровень
+BUSINESS_UPGRADE_BASE_COST = 25_000     # цена апгрейда = база * текущий уровень
+BUSINESS_MAX_LEVEL = 10
+
+# --- Казино ------------------------------------------------------------------
 CASINO_MIN_BET = 10
 CASINO_MAX_BET = 100_000
 SLOT_SYMBOLS = ["🍒", "🍋", "🍇", "💎", "7️⃣"]
-PLAY_AGAIN_TIMEOUT = 120
-COIN_EMOJI = "🪙"
-BJ_TIMEOUT = 90
+PLAY_AGAIN_TIMEOUT = 120  # сколько кнопка «Играть снова» живёт без нажатий
+COIN_EMOJI = "🪙"          # можно заменить на кастомный эмодзи сервера: "<:coin:123456789>"
+BJ_TIMEOUT = 90  # секунд на ход; по таймауту игрок автоматически говорит «Хватит»
 
-# --- Пресеты настроек --------------------------------------------------------
+# --- Настройки сервера: пресеты ----------------------------------------------
+# Хранятся в guild_settings.<guild_id>.eco. Для нового сервера действует «Стандартная».
+# Значения, которых не было в вашем ТЗ (помечены ↓), одинаковы по смыслу и легко меняются здесь.
+_H = 3600
 PRESETS = {
-    "light": {
+    "easy": {
         "label": "🟢 Лёгкая",
-        "cooldown_work": 0,
-        "cooldown_crime": 0,
-        "cooldown_slut": 0,
-        "cooldown_rob": 0,
-        "cooldown_daily": 0,
-        "crime_success": 0.90,
-        "rob_success": 0.80,
-        "tax_rate": 0.0,
-        "work_min": 500,
-        "work_max": 1500,
-        "loan_interest": 0.0,
-        "loan_overdue_penalty": 0.0,
+        "description": "Без кулдаунов и налогов, высокие шансы",
+        "values": {
+            "cooldown_work": 0, "cooldown_crime": 0, "cooldown_slut": 0,
+            "cooldown_rob": 0, "cooldown_daily": 0,
+            "crime_chance": 0.90, "rob_chance": 0.80,
+            "tax_rate": 0.0, "work_min": 500, "work_max": 1500,
+            "loan_interest": 0.0, "loan_penalty": 0.0,
+            "business_tax": 0.0,                      # ↓ налог на имущество бизнеса
+            "daily_min": 300, "daily_max": 500,       # ↓ ежедневный бонус
+        },
     },
     "standard": {
         "label": "🟡 Стандартная",
-        "cooldown_work": 4 * 3600,
-        "cooldown_crime": 2 * 3600,
-        "cooldown_slut": 3 * 3600,
-        "cooldown_rob": 3 * 3600,
-        "cooldown_daily": 24 * 3600,
-        "crime_success": 0.60,
-        "rob_success": 0.45,
-        "tax_rate": 0.13,
-        "work_min": 200,
-        "work_max": 700,
-        "loan_interest": 0.20,
-        "loan_overdue_penalty": 0.05,
+        "description": "Сбалансированная экономика (по умолчанию)",
+        "values": {
+            "cooldown_work": 4 * _H, "cooldown_crime": 2 * _H, "cooldown_slut": 3 * _H,
+            "cooldown_rob": 3 * _H, "cooldown_daily": 24 * _H,
+            "crime_chance": 0.60, "rob_chance": 0.45,
+            "tax_rate": 0.13, "work_min": 200, "work_max": 700,
+            "loan_interest": 0.20, "loan_penalty": 0.05,
+            "business_tax": 0.05,
+            "daily_min": 300, "daily_max": 500,
+        },
     },
     "hardcore": {
         "label": "🔴 Хардкорная",
-        "cooldown_work": 12 * 3600,
-        "cooldown_crime": 8 * 3600,
-        "cooldown_slut": 8 * 3600,
-        "cooldown_rob": 6 * 3600,
-        "cooldown_daily": 24 * 3600,
-        "crime_success": 0.30,
-        "rob_success": 0.20,
-        "tax_rate": 0.30,
-        "work_min": 50,
-        "work_max": 150,
-        "loan_interest": 0.50,
-        "loan_overdue_penalty": 0.10,
+        "description": "Долгие кулдауны, низкие шансы, высокие налоги",
+        "values": {
+            "cooldown_work": 12 * _H, "cooldown_crime": 8 * _H, "cooldown_slut": 8 * _H,
+            "cooldown_rob": 6 * _H, "cooldown_daily": 24 * _H,
+            "crime_chance": 0.30, "rob_chance": 0.20,
+            "tax_rate": 0.30, "work_min": 50, "work_max": 150,
+            "loan_interest": 0.50, "loan_penalty": 0.10,
+            "business_tax": 0.10,
+            "daily_min": 300, "daily_max": 500,
+        },
     },
 }
 DEFAULT_PRESET = "standard"
+DEFAULT_SETTINGS = dict(PRESETS[DEFAULT_PRESET]["values"])
+COOLDOWN_KEYS = ("work", "crime", "slut", "rob", "daily")
 
-# Остальные (фиксированные) параметры, не входящие в пресеты
-CRIME_REWARD = (300, 900)
-SLUT_REWARD = (200, 700)
-DAILY_REWARD = (300, 500)
-CRIME_FINE_RATE = 0.20
-CRIME_FINE_MAX = 500
-ROB_LOOT_RATE = (0.10, 0.30)
-ROB_MAX_LOOT = 5_000
-ROB_MIN_TARGET_CASH = 500
-ROB_FINE_RATE = 0.25
-ROB_FINE_MAX = 1_000
-ROB_VICTIM_PROTECTION = 3600
-LOAN_TERM = 3 * 24 * 3600
-BUSINESS_COST = 50_000
-BUSINESS_HOURLY_INCOME = 1_000
-BUSINESS_INCOME_PER_LEVEL = 500
-BUSINESS_PROPERTY_TAX = 0.05
-BUSINESS_UPGRADE_BASE_COST = 25_000
-BUSINESS_MAX_LEVEL = 10
-COOLDOWN_MAX = 7 * 24 * 3600
-HISTORY_TTL_DAYS = 30
+# ключ -> (тип, минимум, максимум, подпись для формы, подсказка)
+SETTING_SPECS = {
+    "cooldown_work": ("duration", 0, COOLDOWN_MAX, "Кулдаун !work", "4h, 30m, 90s или 0"),
+    "cooldown_crime": ("duration", 0, COOLDOWN_MAX, "Кулдаун !crime", "2h, 30m или 0"),
+    "cooldown_slut": ("duration", 0, COOLDOWN_MAX, "Кулдаун !slut", "3h, 30m или 0"),
+    "cooldown_rob": ("duration", 0, COOLDOWN_MAX, "Кулдаун !rob", "3h, 30m или 0"),
+    "cooldown_daily": ("duration", 0, COOLDOWN_MAX, "Кулдаун !daily", "24h или 0"),
+    "crime_chance": ("rate", 0.0, 1.0, "Шанс успеха !crime и !slut", "0.60 или 60%"),
+    "rob_chance": ("rate", 0.0, 1.0, "Шанс успеха !rob", "0.45 или 45%"),
+    "tax_rate": ("rate", 0.0, 0.9, "Подоходный налог (НДФЛ)", "0.13 или 13%"),
+    "business_tax": ("rate", 0.0, 0.5, "Налог на бизнес (от дохода)", "0.05 или 5%"),
+    "loan_interest": ("rate", 0.0, 2.0, "Процент по кредиту", "0.20 или 20%"),
+    "loan_penalty": ("rate", 0.0, 0.5, "Штраф просрочки (в сутки)", "0.05 или 5%"),
+    "work_min": ("int", 0, 1_000_000, "Зарплата !work: минимум", "200"),
+    "work_max": ("int", 0, 1_000_000, "Зарплата !work: максимум", "700"),
+    "daily_min": ("int", 0, 1_000_000, "Бонус !daily: минимум", "300"),
+    "daily_max": ("int", 0, 1_000_000, "Бонус !daily: максимум", "500"),
+}
+# Разделы формы «Кастомная» (в модальном окне Discord — не больше 5 полей)
+SETTING_SECTIONS = {
+    "chances": {"label": "🎲 Шансы", "title": "Шансы успеха",
+                "keys": ["crime_chance", "rob_chance"]},
+    "taxes": {"label": "💸 Налоги и кредит", "title": "Налоги и кредит",
+              "keys": ["tax_rate", "business_tax", "loan_interest", "loan_penalty"]},
+    "cooldowns": {"label": "⏱️ Кулдауны", "title": "Кулдауны команд",
+                  "keys": ["cooldown_work", "cooldown_crime", "cooldown_slut",
+                           "cooldown_rob", "cooldown_daily"]},
+    "pay": {"label": "💰 Зарплата и бонус", "title": "Зарплата и бонус",
+            "keys": ["work_min", "work_max", "daily_min", "daily_max"]},
+}
 
 # --- ИИ ----------------------------------------------------------------------
+# По умолчанию используется Groq API (есть бесплатный тариф с лимитами).
+# Можно сменить совместимый API, не переписывая код:
+# AI_API_URL, AI_API_KEY, AI_MODEL. Если они не заданы — берутся GROQ_*.
 DEFAULT_AI_URL = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_AI_MODEL = "llama-3.3-70b-versatile"
 LEGACY_MODEL_ALIASES = {
@@ -128,11 +162,12 @@ rng = random.SystemRandom()
 
 
 class EconomyError(Exception):
-    pass
+    """Ожидаемая ошибка. Если её выбросить внутри транзакции — транзакция откатится,
+    а текст ошибки будет показан игроку."""
 
 
 class CooldownError(EconomyError):
-    pass
+    """Кулдаун ещё не прошёл (транзакция откатывается, кулдаун не расходуется)."""
 
 
 # --- Утилиты -----------------------------------------------------------------
@@ -158,6 +193,7 @@ def fmt_duration(seconds):
 
 
 def parse_amount(raw, available):
+    """'all'/'все'/'всё' -> available; иначе положительное целое. Некорректный ввод -> None."""
     raw = str(raw or "").strip().lower()
     if raw in ("all", "max", "все", "всё"):
         return int(available)
@@ -166,6 +202,135 @@ def parse_amount(raw, available):
     except ValueError:
         return None
     return value if value > 0 else None
+
+
+def parse_amount(raw, available):
+    """'all'/'все'/'всё' -> available; иначе положительное целое. Некорректный ввод -> None."""
+    raw = str(raw or "").strip().lower()
+    if raw in ("all", "max", "все", "всё"):
+        return int(available)
+    try:
+        value = int(raw.replace(" ", "").replace("_", ""))
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+async def safe_create_index(collection, keys, *, drop_on_conflict=False, **options):
+    """Создаёт индекс и переживает IndexOptionsConflict (85) / IndexKeySpecsConflict (86):
+    такой индекс уже есть, но с другими опциями (например, TTL из старой версии).
+    drop_on_conflict=False — старый индекс остаётся как есть (для обычных индексов это безопасно);
+    True — старый индекс пересоздаётся (нужно для уникальных индексов, иначе уникальности не будет)."""
+    try:
+        return await collection.create_index(keys, **options)
+    except OperationFailure as e:
+        if e.code not in (85, 86):
+            raise
+        name = getattr(collection, "name", "?")
+        if not drop_on_conflict:
+            log.warning("Индекс %s.%s уже существует с другими опциями — оставляю как есть", name, keys)
+            return None
+        log.warning("Индекс %s.%s конфликтует по опциям — пересоздаю", name, keys)
+        info = await collection.index_information()
+        want = [tuple(k) if isinstance(k, (list, tuple)) else (k, 1)
+                for k in (keys if isinstance(keys, list) else [keys])]
+        for index_name, spec in info.items():
+            if index_name != "_id_" and [tuple(x) for x in spec.get("key", [])] == want:
+                await collection.drop_index(index_name)
+        return await collection.create_index(keys, **options)
+
+
+def ukey(guild_id, user_id):
+    """Фильтр документа игрока: баланс привязан к паре (сервер, пользователь)."""
+    return {"guild_id": int(guild_id), "user_id": int(user_id)}
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def fmt_pct(value):
+    return f"{float(value) * 100:g}%"
+
+
+def fmt_cooldown(seconds):
+    seconds = int(seconds)
+    if seconds <= 0:
+        return "нет"
+    parts = []
+    for size, unit in ((86400, "д"), (3600, "ч"), (60, "мин"), (1, "с")):
+        qty, seconds = divmod(seconds, size)
+        if qty:
+            parts.append(f"{qty} {unit}")
+    return " ".join(parts)
+
+
+def duration_input(seconds):
+    """Секунды -> строка для формы: 4h / 30m / 90s / 0."""
+    seconds = int(seconds)
+    if seconds == 0:
+        return "0"
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if seconds % size == 0:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
+
+
+_DURATION_UNITS = {
+    "": 60, "s": 1, "sec": 1, "с": 1, "сек": 1,
+    "m": 60, "min": 60, "м": 60, "мин": 60,
+    "h": 3600, "hr": 3600, "ч": 3600, "час": 3600, "часа": 3600, "часов": 3600,
+    "d": 86400, "day": 86400, "д": 86400, "дн": 86400, "день": 86400, "дня": 86400, "дней": 86400,
+}
+
+
+def parse_setting(key, raw):
+    """Разбирает и проверяет значение настройки из формы. ValueError — с понятным текстом."""
+    kind, lo, hi, _label, _hint = SETTING_SPECS[key]
+    text = str(raw or "").strip().lower().replace(",", ".").replace(" ", "")
+    if not text:
+        raise ValueError("пустое значение")
+    if kind == "rate":
+        try:
+            value = float(text[:-1]) / 100 if text.endswith("%") else float(text)
+        except ValueError:
+            raise ValueError("ожидается число вроде 0.45 или 45%")
+        if not lo <= value <= hi:
+            raise ValueError(f"допустимо от {fmt_pct(lo)} до {fmt_pct(hi)}")
+        return round(value, 4)
+    if kind == "duration":
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)([a-zа-яё]*)", text)
+        if not match or match.group(2) not in _DURATION_UNITS:
+            raise ValueError("ожидается время вроде 4h, 30m, 90s, 1d или 0")
+        value = int(float(match.group(1)) * _DURATION_UNITS[match.group(2)])
+        if not lo <= value <= hi:
+            raise ValueError(f"допустимо от 0 до {fmt_cooldown(hi)}")
+        return value
+    try:
+        value = int(float(text))
+    except ValueError:
+        raise ValueError("ожидается целое число")
+    if not lo <= value <= hi:
+        raise ValueError(f"допустимо от {fmt(lo)} до {fmt(hi)}")
+    return value
+
+
+def format_setting(key, value):
+    kind = SETTING_SPECS[key][0]
+    if kind == "rate":
+        return fmt_pct(value)
+    if kind == "duration":
+        return fmt_cooldown(value)
+    return fmt(value)
+
+
+def setting_input_default(key, value):
+    kind = SETTING_SPECS[key][0]
+    if kind == "rate":
+        return fmt_pct(value)
+    if kind == "duration":
+        return duration_input(value)
+    return str(int(value))
 
 
 def mongo_uri():
@@ -194,52 +359,17 @@ def business_income(level):
     return BUSINESS_HOURLY_INCOME + BUSINESS_INCOME_PER_LEVEL * (max(1, int(level)) - 1)
 
 
-def business_tax(level):
-    return int(business_income(level) * BUSINESS_PROPERTY_TAX)
+def business_tax(level, rate):
+    return int(business_income(level) * rate)
 
 
 def upgrade_cost(level):
     return BUSINESS_UPGRADE_BASE_COST * max(1, int(level))
 
 
-async def safe_create_index(collection, keys, *, name=None, **options):
-    """
-    Безопасно создаёт индекс. Если индекс с таким именем уже существует,
-    но с другими опциями (например, добавлен/изменён TTL) — пересоздаёт его.
-    Работает для TTL и любого другого конфликта опций (код 85).
-    """
-    # Motor принимает list of (key, direction) для составных, строку для одиночных
-    if isinstance(keys, str):
-        key_spec = keys
-        default_name = f"{keys}_1"
-    elif isinstance(keys, (list, tuple)) and keys and isinstance(keys[0], tuple):
-        key_spec = keys
-        default_name = "_".join(f"{k}_{d}" for k, d in keys)
-    else:
-        key_spec = keys
-        default_name = None
-
-    index_name = name or default_name
-
-    try:
-        return await collection.create_index(key_spec, name=index_name, **options)
-    except OperationFailure as e:
-        if e.code != 85:  # IndexOptionsConflict
-            raise
-        log.warning("Индекс %s уже существует с другими опциями — пересоздаю", index_name)
-        # Пытаемся удалить по имени, если не вышло — по ключу
-        try:
-            await collection.drop_index(index_name)
-        except OperationFailure:
-            try:
-                await collection.drop_index(key_spec)
-            except OperationFailure:
-                log.exception("Не удалось удалить старый индекс %s", index_name)
-                raise
-        return await collection.create_index(key_spec, name=index_name, **options)
-
-
 async def safe_send(target, *args, **kwargs):
+    """Отправка сообщения/файлов без падения при нехватке прав или удалённом канале.
+    Возвращает отправленное сообщение или None."""
     try:
         return await target.send(*args, **kwargs)
     except discord.Forbidden:
@@ -258,71 +388,6 @@ intents.message_content = True
 
 
 # =============================================================================
-# Настройки гильдии (поверх guild_settings)
-# =============================================================================
-class GuildSettings:
-    def __init__(self, bot, guild_id: int, doc: Optional[dict] = None):
-        self.bot = bot
-        self.guild_id = int(guild_id)
-        self.doc = doc or {}
-        self.preset = self.doc.get("preset", DEFAULT_PRESET)
-
-    @property
-    def _defaults(self):
-        return PRESETS.get(self.preset, PRESETS[DEFAULT_PRESET])
-
-    def get(self, key, fallback=None):
-        if key in self.doc and not isinstance(self.doc[key], bool):
-            return self.doc[key]
-        if key in self._defaults:
-            return self._defaults[key]
-        return fallback
-
-    @property
-    def tax_rate(self) -> float:
-        return float(self.get("tax_rate"))
-
-    @property
-    def work_range(self):
-        return int(self.get("work_min")), int(self.get("work_max"))
-
-    @property
-    def crime_success(self) -> float:
-        return float(self.get("crime_success"))
-
-    @property
-    def rob_success(self) -> float:
-        return float(self.get("rob_success"))
-
-    @property
-    def loan_interest(self) -> float:
-        return float(self.get("loan_interest"))
-
-    @property
-    def loan_overdue_penalty(self) -> float:
-        return float(self.get("loan_overdue_penalty"))
-
-    def cooldown(self, key: str) -> int:
-        return int(self.get(f"cooldown_{key}"))
-
-    @property
-    def report_hour(self) -> int:
-        return int(self.doc.get("report_hour", REPORT_HOUR_UTC))
-
-    @property
-    def report_channel_id(self):
-        return self.doc.get("report_channel_id")
-
-    @property
-    def chart_channel_id(self):
-        return self.doc.get("chart_channel_id")
-
-    @property
-    def last_automation_date(self):
-        return self.doc.get("last_automation_date")
-
-
-# =============================================================================
 # ИИ
 # =============================================================================
 class AIError(Exception):
@@ -330,6 +395,9 @@ class AIError(Exception):
 
 
 class AIHandler:
+    """Клиент OpenAI-совместимого API. Groq — бесплатный по умолчанию вариант
+    (с ограничениями тарифа); провайдера можно заменить переменными окружения."""
+
     REPORT_PROMPT = (
         "Ты — финансовый аналитик. Проанализируй эти данные экономики и напиши "
         "краткий отчет (3-4 предложения) о состоянии рынка."
@@ -394,13 +462,20 @@ class AIHandler:
 # =============================================================================
 # Бот
 # =============================================================================
+async def guild_only_check(ctx):
+    """Баланс привязан к серверу, поэтому команды работают только на сервере."""
+    if ctx.guild is None:
+        raise commands.NoPrivateMessage()
+    return True
+
+
 class EconomyBot(commands.Bot):
     def __init__(self):
         super().__init__(
             command_prefix=commands.when_mentioned_or("!"),
             intents=intents,
             help_command=None,
-            activity=discord.Game(name="!balance | !cb | /settings"),
+            activity=discord.Game(name="!balance | !cb"),
         )
         self.mongo = None
         self.db = None
@@ -411,9 +486,9 @@ class EconomyBot(commands.Bot):
         self.funds = None
         self.history = None
         self.settings = None
-        self.casino_stats = None
-        self.casino_active = None
         self.ai = AIHandler()
+        self._settings_cache = {}
+        self.add_check(guild_only_check)
         self.chart_lock = asyncio.Lock()
         self._web_runner = None
         self.chart_files = {
@@ -422,11 +497,10 @@ class EconomyBot(commands.Bot):
         }
 
     async def setup_hook(self):
+        # Render Web Service requires an HTTP listener on the assigned PORT.
         app = web.Application()
-
         async def health(request):
-            return web.json_response({"status": "ok", "service": "discord-economy-bot", "version": BOT_VERSION})
-
+            return web.json_response({"status": "ok", "service": "discord-economy-bot"})
         app.router.add_get("/", health)
         app.router.add_get("/health", health)
         self._web_runner = web.AppRunner(app)
@@ -446,40 +520,19 @@ class EconomyBot(commands.Bot):
         self.history = self.db.economy_history
         self.settings = self.db.guild_settings
         self.casino_stats = self.db.casino_stats
-        self.casino_active = self.db.casino_active
 
-        # --- ИНДЕКСЫ (безопасное создание) ---
-        # users: составной уникальный (guild_id, user_id)
-        await safe_create_index(
-            self.db_users, [("guild_id", 1), ("user_id", 1)], unique=True
-        )
-        await safe_create_index(self.db_users, [("guild_id", 1), ("cash", -1)])
-        await safe_create_index(self.db_users, [("guild_id", 1), ("bank", -1)])
-
-        # businesses: составной уникальный
-        await safe_create_index(
-            self.businesses, [("guild_id", 1), ("user_id", 1)], unique=True
-        )
-
-        # casino_stats: составной уникальный
-        await safe_create_index(
-            self.casino_stats, [("guild_id", 1), ("user_id", 1)], unique=True
-        )
-
-        # casino_active: активные партии блэкджека + TTL 1 час
-        await safe_create_index(
-            self.casino_active, [("guild_id", 1), ("user_id", 1)], unique=True
-        )
-        await safe_create_index(
-            self.casino_active, "created_at", expireAfterSeconds=3600
-        )
-
-        # история: TTL 30 дней — с обработкой конфликта старых индексов
-        await safe_create_index(
-            self.history, "created_at", expireAfterSeconds=HISTORY_TTL_DAYS * 86400
-        )
+        # Старые документы (users._id = user_id) переносим ДО создания уникальных индексов.
+        await self.migrate_legacy()
+        await safe_create_index(self.history, "created_at")
         await safe_create_index(self.tx, "created_at")
-
+        await safe_create_index(self.tx, [("guild_id", 1), ("created_at", 1)])
+        await safe_create_index(self.db_users, [("guild_id", 1), ("user_id", 1)],
+                                unique=True, drop_on_conflict=True)
+        await safe_create_index(self.db_users, [("guild_id", 1), ("cash", -1)])
+        await safe_create_index(self.businesses, [("guild_id", 1), ("user_id", 1)],
+                                unique=True, drop_on_conflict=True)
+        await safe_create_index(self.casino_stats, [("guild_id", 1), ("user_id", 1)],
+                                unique=True, drop_on_conflict=True)
         await self.economy.update_one(
             {"_id": "central_bank"},
             {"$setOnInsert": {"reserve": 0, "printed": 0, "created_at": now()},
@@ -492,11 +545,10 @@ class EconomyBot(commands.Bot):
              "$set": {"updated_at": now()}},
             upsert=True,
         )
-
-        await self.add_cog(SettingsCog(self))
         await self.add_cog(EconomyCog(self))
         await self.add_cog(CasinoCog(self))
         await self.add_cog(AICog(self))
+        await self.add_cog(SettingsCog(self))
         if not self.ai.enabled:
             log.info("GROQ_API_KEY не задан — ИИ-функции отключены.")
         try:
@@ -542,77 +594,136 @@ class EconomyBot(commands.Bot):
             text = "⚠️ Внутренняя ошибка. Попробуй ещё раз чуть позже."
         await safe_send(ctx, text)
 
-    # --- Настройки гильдии ---------------------------------------------------
-    async def get_guild_settings(self, guild_id: int) -> GuildSettings:
-        doc = await self.settings.find_one({"_id": int(guild_id)}) or {}
-        return GuildSettings(self, guild_id, doc)
+    # --- Миграция со старой схемы -------------------------------------------
+    async def migrate_legacy(self):
+        """Старые документы (без user_id; _id = id игрока) принадлежали единой глобальной
+        экономике. Если задана переменная LEGACY_GUILD_ID — они переносятся на этот сервер.
+        Иначе они не удаляются, а переносятся в архивные коллекции <имя>_legacy
+        (позже их можно импортировать, задав LEGACY_GUILD_ID и перезапустив бота)."""
+        raw = (os.getenv("LEGACY_GUILD_ID") or "").strip()
+        legacy_gid = int(raw) if raw.isdigit() else None
+        for name, coll in (("users", self.db_users), ("businesses", self.businesses),
+                           ("casino_stats", self.casino_stats)):
+            archive = self.db[f"{name}_legacy"]
+            moved = 0
+            async for doc in coll.find({"user_id": {"$exists": False}}):
+                if legacy_gid is None:
+                    try:
+                        await archive.insert_one(doc)
+                    except DuplicateKeyError:
+                        pass
+                    await coll.delete_one({"_id": doc["_id"]})
+                else:
+                    await self._import_legacy_doc(coll, doc, legacy_gid)
+                    await coll.delete_one({"_id": doc["_id"]})
+                moved += 1
+            if legacy_gid is not None:
+                async for doc in archive.find({}):
+                    if await self._import_legacy_doc(coll, doc, legacy_gid):
+                        moved += 1
+                    await archive.delete_one({"_id": doc["_id"]})
+            if moved:
+                if legacy_gid is None:
+                    log.warning("Миграция: %s старых документов %s перенесено в %s_legacy. "
+                                "Задайте LEGACY_GUILD_ID, чтобы импортировать их на нужный сервер.",
+                                moved, name, name)
+                else:
+                    log.info("Миграция: %s документов %s перенесено на сервер %s", moved, name, legacy_gid)
 
-    async def save_preset(self, guild_id: int, preset_name: str) -> GuildSettings:
-        if preset_name not in PRESETS:
-            raise ValueError(f"Неизвестный пресет: {preset_name}")
-        preset = PRESETS[preset_name]
-        update = {"preset": preset_name, "updated_at": now()}
-        update.update({k: v for k, v in preset.items() if k != "label"})
-        await self.settings.update_one({"_id": int(guild_id)}, {"$set": update}, upsert=True)
-        return await self.get_guild_settings(guild_id)
+    @staticmethod
+    async def _import_legacy_doc(coll, doc, guild_id):
+        new = {k: v for k, v in doc.items() if k != "_id"}
+        new["guild_id"] = int(guild_id)
+        new["user_id"] = int(doc["_id"])
+        try:
+            await coll.insert_one(new)
+            return True
+        except DuplicateKeyError:
+            return False  # у игрока на этом сервере уже есть новый документ — старый не затираем
 
-    async def save_custom_setting(self, guild_id: int, key: str, value) -> GuildSettings:
-        await self.settings.update_one(
-            {"_id": int(guild_id)},
-            {"$set": {"preset": "custom", key: value, "updated_at": now()}},
-            upsert=True,
-        )
-        return await self.get_guild_settings(guild_id)
+    # --- Настройки сервера ---------------------------------------------------
+    def invalidate_settings(self, guild_id):
+        self._settings_cache.pop(int(guild_id), None)
 
-    # --- Работа с пользователями (мультисерверная) ---------------------------
+    async def get_settings(self, guild_id) -> dict:
+        """Настройки экономики сервера. Если в guild_settings пусто — пресет «Стандартная»."""
+        gid = int(guild_id)
+        cached = self._settings_cache.get(gid)
+        if cached and cached[0] > time.monotonic():
+            return dict(cached[1])
+        doc = await self.settings.find_one({"_id": gid}) or {}
+        eco = doc.get("eco") or {}
+        cfg = dict(DEFAULT_SETTINGS)
+        legacy_used = False
+        for key in COOLDOWN_KEYS:  # старый формат: cooldown_<команда> в корне документа
+            legacy = doc.get(f"cooldown_{key}")
+            if _is_number(legacy) and legacy >= 0:
+                cfg[f"cooldown_{key}"] = legacy
+                legacy_used = True
+        for key, value in eco.items():
+            if key in DEFAULT_SETTINGS and _is_number(value):
+                cfg[key] = value
+        for key, (kind, *_rest) in SETTING_SPECS.items():
+            cfg[key] = float(cfg[key]) if kind == "rate" else int(cfg[key])
+        preset = eco.get("preset")
+        if preset not in PRESETS and preset != "custom":
+            preset = "custom" if legacy_used else DEFAULT_PRESET
+        cfg["preset"] = preset
+        self._settings_cache[gid] = (time.monotonic() + 30, cfg)
+        return dict(cfg)
+
+    async def get_cooldown(self, guild_id, key: str) -> int:
+        return int((await self.get_settings(guild_id))[f"cooldown_{key}"])
+
+    # --- Работа с БД ---------------------------------------------------------
     async def ensure_user(self, guild_id: int, user_id: int, *, session=None):
-        await self.db_users.update_one(
-            {"guild_id": int(guild_id), "user_id": int(user_id)},
-            {"$setOnInsert": {
-                "guild_id": int(guild_id),
-                "user_id": int(user_id),
-                "cash": 0, "bank": 0, "debt": 0,
-                "last_work": None, "last_crime": None, "last_slut": None,
-                "last_daily": None, "last_rob": None,
-                "created_at": now(),
-            }},
-            upsert=True, session=session,
-        )
-        return await self.db_users.find_one(
-            {"guild_id": int(guild_id), "user_id": int(user_id)}, session=session
-        )
+        """Находит или создаёт документ игрока на сервере (guild_id, user_id)."""
+        flt = ukey(guild_id, user_id)
+        try:
+            await self.db_users.update_one(
+                flt,
+                {"$setOnInsert": {"cash": 0, "bank": 0, "debt": 0,
+                                  "last_work": None, "last_crime": None, "last_slut": None,
+                                  "last_rob": None, "last_daily": None, "created_at": now()}},
+                upsert=True, session=session,
+            )
+        except DuplicateKeyError:
+            pass  # параллельный запрос уже создал документ
+        return await self.db_users.find_one(flt, session=session)
 
     async def get_balance(self, guild_id: int, user_id: int):
         return await self.ensure_user(guild_id, user_id)
 
     async def change_cash(self, guild_id: int, user_id: int, delta: int, *, session=None):
+        """Атомарное изменение наличных. Отрицательное изменение не уводит cash в минус."""
         delta = int(delta)
         await self.ensure_user(guild_id, user_id, session=session)
-        query = {"guild_id": int(guild_id), "user_id": int(user_id)}
+        flt = ukey(guild_id, user_id)
         if delta < 0:
-            query["cash"] = {"$gte": -delta}
+            flt["cash"] = {"$gte": -delta}
         result = await self.db_users.update_one(
-            query, {"$inc": {"cash": delta}, "$set": {"updated_at": now()}}, session=session
-        )
+            flt, {"$inc": {"cash": delta}, "$set": {"updated_at": now()}}, session=session)
         return result.modified_count == 1
 
     async def change_bank(self, guild_id: int, user_id: int, delta: int, *, session=None):
         delta = int(delta)
         await self.ensure_user(guild_id, user_id, session=session)
-        query = {"guild_id": int(guild_id), "user_id": int(user_id)}
+        flt = ukey(guild_id, user_id)
         if delta < 0:
-            query["bank"] = {"$gte": -delta}
+            flt["bank"] = {"$gte": -delta}
         result = await self.db_users.update_one(
-            query, {"$inc": {"bank": delta}, "$set": {"updated_at": now()}}, session=session
-        )
+            flt, {"$inc": {"bank": delta}, "$set": {"updated_at": now()}}, session=session)
         return result.modified_count == 1
 
-    async def journal(self, source, destination, amount, reason, meta=None, *, session=None):
-        await self.tx.insert_one({
+    async def journal(self, source, destination, amount, reason, meta=None, *, session=None, guild_id=None):
+        doc = {
             "source": str(source), "destination": str(destination),
             "amount": int(amount), "reason": reason,
             "meta": meta or {}, "created_at": now(),
-        }, session=session)
+        }
+        if guild_id is not None:
+            doc["guild_id"] = int(guild_id)
+        await self.tx.insert_one(doc, session=session)
 
     async def transfer_players(self, guild_id: int, sender_id: int, recipient_id: int, amount: int):
         amount = int(amount)
@@ -621,64 +732,59 @@ class EconomyBot(commands.Bot):
         await self.ensure_user(guild_id, sender_id)
         await self.ensure_user(guild_id, recipient_id)
         try:
+            # MongoDB transactions require a replica set/sharded cluster (Atlas supports this).
             async with await self.mongo.start_session() as session:
                 async with session.start_transaction():
-                    sender = await self.db_users.find_one(
-                        {"guild_id": int(guild_id), "user_id": int(sender_id)}, session=session
-                    )
+                    sender = await self.db_users.find_one(ukey(guild_id, sender_id), session=session)
                     if int(sender.get("debt", 0)) > 0:
                         raise EconomyError("У тебя есть долг. Погаси его перед переводами.")
                     if int(sender.get("cash", 0)) < amount:
                         raise EconomyError("Недостаточно наличных.")
                     debited = await self.db_users.update_one(
-                        {"guild_id": int(guild_id), "user_id": int(sender_id),
-                         "cash": {"$gte": amount}, "debt": 0},
+                        {**ukey(guild_id, sender_id), "cash": {"$gte": amount}, "debt": 0},
                         {"$inc": {"cash": -amount}, "$set": {"updated_at": now()}},
                         session=session,
                     )
                     if debited.modified_count != 1:
                         raise EconomyError("Перевод отклонён: проверь баланс и долг.")
                     await self.db_users.update_one(
-                        {"guild_id": int(guild_id), "user_id": int(recipient_id)},
+                        ukey(guild_id, recipient_id),
                         {"$inc": {"cash": amount}, "$set": {"updated_at": now()}},
                         session=session,
                     )
-                    await self.journal(
-                        f"user_{guild_id}_{sender_id}", f"user_{guild_id}_{recipient_id}",
-                        amount, "Перевод между игроками",
-                        {"type": "player_transfer", "guild_id": guild_id}, session=session,
-                    )
+                    await self.journal(f"user_{sender_id}", f"user_{recipient_id}", amount,
+                                       "Перевод между игроками",
+                                       {"type": "player_transfer"}, session=session, guild_id=guild_id)
         except EconomyError as e:
             return False, str(e)
         return True, "Перевод выполнен."
 
     async def claim_cooldown(self, guild_id: int, user_id: int, key: str, cooldown: int, *, session) -> bool:
+        """Атомарно «занимает» кулдаун: апдейт срабатывает, только если last_<key> пуст
+        или старше cooldown секунд. Две одновременные команды не пройдут обе."""
         field = f"last_{key}"
         current = now()
         threshold = current - timedelta(seconds=int(cooldown))
         result = await self.db_users.update_one(
-            {"guild_id": int(guild_id), "user_id": int(user_id),
-             "$or": [{field: None}, {field: {"$lte": threshold}}]},
+            {**ukey(guild_id, user_id), "$or": [{field: None}, {field: {"$lte": threshold}}]},
             {"$set": {field: current, "updated_at": current}},
             session=session,
         )
         return result.matched_count == 1
 
     async def cooldown_left(self, guild_id: int, user_id: int, key: str, cooldown: int) -> float:
-        doc = await self.db_users.find_one(
-            {"guild_id": int(guild_id), "user_id": int(user_id)}, {f"last_{key}": 1}
-        ) or {}
+        doc = await self.db_users.find_one(ukey(guild_id, user_id), {f"last_{key}": 1}) or {}
         last = as_utc(doc.get(f"last_{key}"))
         if last is None:
             return 0
         return max(0, cooldown - (now() - last).total_seconds())
 
-    # --- Глобальная экономика (без гильдии) ----------------------------------
     async def fund_balance(self, name="state_budget"):
         doc = await self.funds.find_one({"_id": name})
         return int((doc or {}).get("balance", 0))
 
-    async def add_budget(self, amount: int, reason: str, *, session=None, source="taxpayer"):
+    async def add_budget(self, amount: int, reason: str, *, session=None, source="taxpayer", guild_id=None):
+        """Госбюджет — глобальный. guild_id нужен только для журнала (статистика по серверу)."""
         amount = int(amount)
         if amount <= 0:
             return
@@ -688,32 +794,35 @@ class EconomyBot(commands.Bot):
              "$setOnInsert": {"name": "Государственный бюджет", "created_at": now()}},
             upsert=True, session=session,
         )
-        await self.journal(source, "fund_state_budget", amount, reason, session=session)
+        await self.journal(source, "fund_state_budget", amount, reason, session=session, guild_id=guild_id)
 
-    async def _pay_earning_tx(self, session, guild_id, user_id, gross, tax, net, reason, account):
+    async def _pay_earning_tx(self, session, guild_id, user_id, gross, tax, net, reason, account, tax_rate):
         await self.db_users.update_one(
-            {"guild_id": int(guild_id), "user_id": int(user_id)},
+            ukey(guild_id, user_id),
             {"$inc": {account: net}, "$set": {"updated_at": now()}},
             session=session,
         )
-        await self.add_budget(tax, f"НДФЛ: {reason}", session=session)
-        await self.journal(
-            "economy", f"user_{guild_id}_{user_id}", net, reason,
-            {"gross": gross, "tax": tax, "guild_id": guild_id}, session=session,
-        )
+        await self.add_budget(tax, f"НДФЛ {fmt_pct(tax_rate)}: {reason}", session=session,
+                              guild_id=guild_id)
+        await self.journal("economy", f"user_{user_id}", net, reason,
+                           {"gross": gross, "tax": tax, "tax_rate": tax_rate},
+                           session=session, guild_id=guild_id)
 
-    async def pay_earning(self, guild_id: int, user_id: int, gross: int, tax_rate: float,
-                          reason: str, *, account="cash", session=None):
+    async def pay_earning(self, guild_id: int, user_id: int, gross: int, reason: str, *,
+                          tax_rate: float, account="cash", session=None):
+        """Начисляет доход за вычетом НДФЛ (ставка — из настроек сервера). Если передана session —
+        работает внутри уже открытой транзакции вызывающего (вложенные транзакции запрещены)."""
         gross = max(0, int(gross))
-        tax = int(gross * tax_rate)
+        tax = int(gross * float(tax_rate))
         net = gross - tax
         await self.ensure_user(guild_id, user_id, session=session)
         if session is not None:
-            await self._pay_earning_tx(session, guild_id, user_id, gross, tax, net, reason, account)
+            await self._pay_earning_tx(session, guild_id, user_id, gross, tax, net, reason, account, tax_rate)
         else:
             async with await self.mongo.start_session() as own_session:
                 async with own_session.start_transaction():
-                    await self._pay_earning_tx(own_session, guild_id, user_id, gross, tax, net, reason, account)
+                    await self._pay_earning_tx(own_session, guild_id, user_id, gross, tax, net,
+                                               reason, account, tax_rate)
         return gross, tax, net
 
     async def reserve(self, *, session=None):
@@ -721,6 +830,8 @@ class EconomyBot(commands.Bot):
         return int((doc or {}).get("reserve", 0))
 
     async def change_reserve(self, delta: int, *, session=None, allow_negative=False):
+        """Изменение резерва ЦБ. Списание блокируется, если не хватает резерва,
+        кроме случая allow_negative=True (выплата уже принятых ставок)."""
         delta = int(delta)
         if delta < 0 and not allow_negative:
             result = await self.economy.update_one(
@@ -736,42 +847,32 @@ class EconomyBot(commands.Bot):
             )
         return result.modified_count == 1
 
-    async def stats(self, guild_id: Optional[int] = None):
+    async def stats(self, guild_id=None):
+        """Резерв ЦБ, госбюджет и фонды — глобальные. Игроки, долги и обороты за 24 ч —
+        по серверу, если передан guild_id (иначе по всем серверам)."""
         reserve = await self.reserve()
         budget = await self.fund_balance("state_budget")
-        fund_rows = await self.funds.aggregate(
-            [{"$group": {"_id": None, "total": {"$sum": "$balance"}}}]
-        ).to_list(1)
+        fund_rows = await self.funds.aggregate([{"$group": {"_id": None, "total": {"$sum": "$balance"}}}]).to_list(1)
         funds_total = int(fund_rows[0]["total"]) if fund_rows else 0
-
-        match = {"guild_id": int(guild_id)} if guild_id is not None else {}
-        pipeline = [
-            {"$match": match},
-            {"$group": {"_id": None, "cash": {"$sum": "$cash"}, "bank": {"$sum": "$bank"},
-                        "debt": {"$sum": "$debt"}}},
-        ]
-        players_rows = await self.db_users.aggregate(pipeline).to_list(1)
+        scope = {"guild_id": int(guild_id)} if guild_id is not None else {"guild_id": {"$exists": True}}
+        players_rows = await self.db_users.aggregate([
+            {"$match": scope},
+            {"$group": {"_id": None, "cash": {"$sum": "$cash"}, "bank": {"$sum": "$bank"}, "debt": {"$sum": "$debt"}}},
+        ]).to_list(1)
         p = players_rows[0] if players_rows else {}
         players = int(p.get("cash", 0)) + int(p.get("bank", 0))
         player_debt = int(p.get("debt", 0))
         central = await self.economy.find_one({"_id": "central_bank"}) or {}
         since = now() - timedelta(hours=24)
-
-        tx_match_in = {"created_at": {"$gte": since}, "destination": {"$regex": "user_"}}
-        tx_match_out = {"created_at": {"$gte": since}, "source": {"$regex": "user_"}}
-        if guild_id is not None:
-            tx_match_in["meta.guild_id"] = int(guild_id)
-            tx_match_out["meta.guild_id"] = int(guild_id)
-
+        tx_scope = {"guild_id": int(guild_id)} if guild_id is not None else {}
         incoming = await self.tx.aggregate([
-            {"$match": tx_match_in},
+            {"$match": {"created_at": {"$gte": since}, "destination": {"$regex": "^user_"}, **tx_scope}},
             {"$group": {"_id": None, "n": {"$sum": "$amount"}}},
         ]).to_list(1)
         outgoing = await self.tx.aggregate([
-            {"$match": tx_match_out},
+            {"$match": {"created_at": {"$gte": since}, "source": {"$regex": "^user_"}, **tx_scope}},
             {"$group": {"_id": None, "n": {"$sum": "$amount"}}},
         ]).to_list(1)
-
         return {
             "reserve": reserve, "funds": funds_total, "budget": budget,
             "players": players, "player_debt": player_debt,
@@ -793,25 +894,24 @@ class EconomyBot(commands.Bot):
     def _render_chart(rows, title, path):
         dates = [as_utc(r["created_at"]) for r in rows]
         fig, ax = plt.subplots(figsize=(13, 6.5))
-        try:
-            ax.plot(dates, [int(r.get("reserve", 0)) for r in rows], label="Резерв ЦБ", linewidth=2)
-            ax.plot(dates, [int(r.get("circulation", 0)) for r in rows], label="В обращении", linewidth=2)
-            ax.plot(dates, [int(r.get("debt", 0)) for r in rows], label="Дефицит ЦБ", linewidth=2)
-            ax.plot(dates, [int(r.get("state_budget", r.get("budget", 0))) for r in rows],
-                    label="Госбюджет", linewidth=2)
-            ax.axhline(0, linewidth=1)
-            ax.set_title(title)
-            ax.set_xlabel("Время")
-            ax.set_ylabel("Монеты")
-            ax.grid(True, alpha=0.25)
-            ax.legend()
-            fig.autofmt_xdate(rotation=30)
-            fig.tight_layout()
-            fig.savefig(path, dpi=120, bbox_inches="tight")
-        finally:
-            plt.close(fig)
+        ax.plot(dates, [int(r.get("reserve", 0)) for r in rows], label="Резерв ЦБ", linewidth=2)
+        ax.plot(dates, [int(r.get("circulation", 0)) for r in rows], label="В обращении", linewidth=2)
+        ax.plot(dates, [int(r.get("debt", 0)) for r in rows], label="Дефицит ЦБ", linewidth=2)
+        ax.plot(dates, [int(r.get("state_budget", r.get("budget", 0))) for r in rows],
+                label="Госбюджет", linewidth=2)
+        ax.axhline(0, linewidth=1)
+        ax.set_title(title)
+        ax.set_xlabel("Время")
+        ax.set_ylabel("Монеты")
+        ax.grid(True, alpha=0.25)
+        ax.legend()
+        fig.autofmt_xdate(rotation=30)
+        fig.tight_layout()
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
 
     async def publish_charts(self, channel=None) -> bool:
+        """Строит графики и отправляет их в канал. True — если сообщение доставлено."""
         async with self.chart_lock:
             rows = await self.history.find({}).sort("created_at", 1).to_list(100000)
             if not rows:
@@ -819,10 +919,8 @@ class EconomyBot(commands.Bot):
             clean = [r for r in rows if as_utc(r.get("created_at"))]
             day = [r for r in clean if as_utc(r["created_at"]) >= now() - timedelta(hours=24)] or clean[-1:]
             try:
-                await asyncio.to_thread(self._render_chart, clean[-2500:],
-                                        "Экономика — вся история", self.chart_files["all"])
-                await asyncio.to_thread(self._render_chart, day[-1500:],
-                                        "Экономика — последние 24 часа", self.chart_files["24h"])
+                await asyncio.to_thread(self._render_chart, clean[-2500:], "Экономика — вся история", self.chart_files["all"])
+                await asyncio.to_thread(self._render_chart, day[-1500:], "Экономика — последние 24 часа", self.chart_files["24h"])
             except Exception:
                 log.exception("Не удалось построить графики")
                 return False
@@ -842,7 +940,6 @@ class EconomyBot(commands.Bot):
             )
             return message is not None
 
-    # --- Фоновые задачи ------------------------------------------------------
     @tasks.loop(hours=1)
     async def business_loop(self):
         current = now()
@@ -850,42 +947,44 @@ class EconomyBot(commands.Bot):
             last = as_utc(business.get("last_payout"))
             if last and (current - last).total_seconds() < 3600:
                 continue
-            gid = int(business["guild_id"])
-            uid = int(business["user_id"])
+            gid, uid = business.get("guild_id"), business.get("user_id")
+            if gid is None or uid is None:
+                continue
+            gid, uid = int(gid), int(uid)
             level = max(1, int(business.get("level", 1)))
-            income = business_income(level)
-            tax = business_tax(level)
             try:
+                cfg = await self.get_settings(gid)
+                income = business_income(level)
+                tax = business_tax(level, cfg["business_tax"])
                 async with await self.mongo.start_session() as session:
                     async with session.start_transaction():
                         await self.ensure_user(gid, uid, session=session)
+                        # Налог на имущество списывается с наличных. Нет наличных — бизнес замораживается.
                         debit = await self.db_users.update_one(
-                            {"guild_id": gid, "user_id": uid, "cash": {"$gte": tax}},
-                            {"$inc": {"cash": -tax, "bank": income},
-                             "$set": {"updated_at": current}},
+                            {**ukey(gid, uid), "cash": {"$gte": tax}},
+                            {"$inc": {"cash": -tax, "bank": income}, "$set": {"updated_at": current}},
                             session=session,
                         )
                         if debit.modified_count != 1:
                             await self.businesses.update_one(
-                                {"guild_id": gid, "user_id": uid},
+                                ukey(gid, uid),
                                 {"$set": {"frozen": True, "last_checked": current}},
                                 session=session,
                             )
                             continue
-                        await self.add_budget(tax, "Налог на имущество бизнеса", session=session)
+                        await self.add_budget(tax, f"Налог на имущество бизнеса {fmt_pct(cfg['business_tax'])}",
+                                              session=session, guild_id=gid)
                         await self.businesses.update_one(
-                            {"guild_id": gid, "user_id": uid},
+                            ukey(gid, uid),
                             {"$set": {"last_payout": current, "last_checked": current, "frozen": False}},
                             session=session,
                         )
-                        await self.journal(
-                            f"business_{gid}_{uid}", f"user_{gid}_{uid}", income,
-                            "Доход бизнеса", {"property_tax": tax, "level": level, "guild_id": gid},
-                            session=session,
-                        )
-                log.info("Business payout gid=%s uid=%s level=%s", gid, uid, level)
+                        await self.journal(f"business_{uid}", f"user_{uid}", income,
+                                           "Доход бизнеса", {"property_tax": tax, "level": level},
+                                           session=session, guild_id=gid)
+                log.info("Business payout guild=%s uid=%s level=%s income=%s tax=%s", gid, uid, level, income, tax)
             except Exception:
-                log.exception("Business payout failed for gid=%s uid=%s", gid, uid)
+                log.exception("Business payout failed for guild=%s uid=%s", gid, uid)
 
     @business_loop.before_loop
     async def before_business_loop(self):
@@ -893,46 +992,50 @@ class EconomyBot(commands.Bot):
 
     @tasks.loop(hours=1)
     async def loan_loop(self):
+        """Просрочка кредита: + loan_penalty (из настроек сервера) к долгу за каждые полные сутки."""
         current = now()
         async for user in self.db_users.find({"debt": {"$gt": 0}}):
-            gid = int(user["guild_id"])
-            uid = int(user["user_id"])
+            gid, uid = user.get("guild_id"), user.get("user_id")
+            if gid is None or uid is None:
+                continue
+            gid, uid = int(gid), int(uid)
             try:
-                settings = await self.get_guild_settings(gid)
-                penalty_rate = settings.loan_overdue_penalty
                 due = as_utc(user.get("loan_due"))
                 if due is None:
+                    # Долг без срока: срок отсчитывается с первого обнаружения.
                     await self.db_users.update_one(
-                        {"guild_id": gid, "user_id": uid, "debt": {"$gt": 0}, "loan_due": None},
+                        {**ukey(gid, uid), "debt": {"$gt": 0}, "loan_due": None},
                         {"$set": {"loan_due": current + timedelta(seconds=LOAN_TERM)}},
                     )
                     continue
-                if current <= due or penalty_rate <= 0:
+                if current <= due:
                     continue
                 last = as_utc(user.get("loan_penalty_at")) or due
                 periods = min(int((current - last).total_seconds() // 86400), 30)
                 if periods < 1:
                     continue
+                rate = (await self.get_settings(gid))["loan_penalty"]
                 debt = int(user["debt"])
                 new_debt = debt
                 for _ in range(periods):
-                    new_debt += max(1, int(new_debt * penalty_rate))
+                    new_debt += int(new_debt * rate)
+                # Даже при нулевом штрафе сдвигаем отметку, чтобы потом не начислить задним числом.
                 result = await self.db_users.update_one(
-                    {"guild_id": gid, "user_id": uid, "debt": debt},
-                    {"$set": {"debt": new_debt,
-                              "loan_penalty_at": last + timedelta(days=periods),
+                    {**ukey(gid, uid), "debt": debt},
+                    {"$set": {"debt": new_debt, "loan_penalty_at": last + timedelta(days=periods),
                               "updated_at": current}},
                 )
-                if result.modified_count == 1:
-                    log.info("Loan overdue gid=%s uid=%s debt %s -> %s", gid, uid, debt, new_debt)
+                if result.modified_count == 1 and new_debt != debt:
+                    log.info("Loan overdue penalty guild=%s uid=%s debt %s -> %s (%s дн.)",
+                             gid, uid, debt, new_debt, periods)
             except Exception:
-                log.exception("Loan penalty failed for gid=%s uid=%s", gid, uid)
+                log.exception("Loan penalty failed for guild=%s uid=%s", gid, uid)
 
     @loan_loop.before_loop
     async def before_loan_loop(self):
         await self.wait_until_ready()
 
-    @tasks.loop(minutes=15)
+    @tasks.loop(minutes=5)
     async def snapshot_loop(self):
         try:
             await self.snapshot()
@@ -955,48 +1058,51 @@ class EconomyBot(commands.Bot):
 
     @tasks.loop(minutes=5)
     async def daily_report_loop(self):
+        """Отправляет ежедневную сводку и/или графики в настроенные каналы."""
         current = now()
-        async for config in self.settings.find({"$or": [
+        if current.hour != REPORT_HOUR_UTC:
+            return
+        date_key = current.strftime("%Y-%m-%d")
+        query = {"$or": [
             {"report_channel_id": {"$exists": True}},
             {"chart_channel_id": {"$exists": True}},
-        ]}):
-            gid = int(config["_id"])
-            settings = GuildSettings(self, gid, config)
-            if current.hour != settings.report_hour:
+        ]}
+        async for config in self.settings.find(query):
+            if config.get("last_automation_date") == date_key:
                 continue
-            date_key = current.strftime("%Y-%m-%d")
-            if settings.last_automation_date == date_key:
-                continue
-            guild = self.get_guild(gid)
+            guild = self.get_guild(int(config["_id"]))
             if guild is None:
                 continue
             try:
-                stats = await self.stats(guild_id=gid)
-                if settings.report_channel_id:
-                    channel = await self._resolve_channel(guild, settings.report_channel_id)
+                stats = await self.stats(int(config["_id"]))
+                report_channel_id = config.get("report_channel_id")
+                if report_channel_id:
+                    channel = await self._resolve_channel(guild, report_channel_id)
                     if channel is not None:
                         await safe_send(
                             channel,
                             "📊 **Ежедневный экономический отчёт**\n"
                             f"🏦 Резерв ЦБ: `{fmt(stats['reserve'])}`\n"
                             f"💰 Госбюджет: `{fmt(stats['budget'])}`\n"
-                            f"👥 Средства игроков: `{fmt(stats['players'])}`\n"
+                            f"👥 Средства игроков сервера: `{fmt(stats['players'])}`\n"
                             f"🪙 В обращении: `{fmt(stats['circulation'])}`\n"
                             f"📉 Долги игроков: `{fmt(stats['player_debt'])}`\n"
                             f"↗️ Приход за 24 ч: `{fmt(stats['incoming'])}`\n"
                             f"↘️ Расход за 24 ч: `{fmt(stats['outgoing'])}`\n"
                             f"🕒 Дата отчёта: `{date_key} UTC`"
                         )
-                if settings.chart_channel_id:
-                    chart_channel = await self._resolve_channel(guild, settings.chart_channel_id)
+                chart_channel_id = config.get("chart_channel_id")
+                if chart_channel_id:
+                    chart_channel = await self._resolve_channel(guild, chart_channel_id)
                     if chart_channel is not None:
+                        await self.snapshot()
                         await self.publish_charts(channel=chart_channel)
                 await self.settings.update_one(
-                    {"_id": gid},
+                    {"_id": int(config["_id"])},
                     {"$set": {"last_automation_date": date_key}},
                 )
             except Exception:
-                log.exception("Daily report failed for guild %s", gid)
+                log.exception("Daily report/graphs failed for guild %s", config.get("_id"))
 
     @daily_report_loop.before_loop
     async def before_daily_report_loop(self):
@@ -1004,186 +1110,22 @@ class EconomyBot(commands.Bot):
 
 
 # =============================================================================
-# SettingsCog — панель настроек /settings с пресетами
-# =============================================================================
-class PresetSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(label="🟢 Лёгкая", value="light",
-                                 description="Без кулдаунов, высокий шанс успеха, без налогов"),
-            discord.SelectOption(label="🟡 Стандартная", value="standard",
-                                 description="Классический баланс: 4ч work, налог 13%"),
-            discord.SelectOption(label="🔴 Хардкорная", value="hardcore",
-                                 description="Долгие кулдауны, низкий шанс, налог 30%"),
-            discord.SelectOption(label="⚙️ Кастомная", value="custom",
-                                 description="Настроить вручную через модальное окно"),
-        ]
-        super().__init__(placeholder="Выбери пресет...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        guild_id = interaction.guild.id
-        if self.values[0] == "custom":
-            modal = CustomSettingsModal(self.view.cog.bot, guild_id)
-            await interaction.response.send_modal(modal)
-            return
-        settings = await self.view.cog.bot.save_preset(guild_id, self.values[0])
-        embed = self.view.cog.build_embed(settings, self.values[0])
-        await interaction.response.edit_message(embed=embed, view=self.view)
-
-
-class CustomSettingsModal(discord.ui.Modal, title="Кастомные настройки"):
-    def __init__(self, bot, guild_id: int):
-        super().__init__()
-        self.bot = bot
-        self.guild_id = guild_id
-
-    tax_rate = discord.ui.TextInput(
-        label="Налог (0.0 - 1.0)", placeholder="0.13", default="0.13",
-        required=True, max_length=6,
-    )
-    work_min = discord.ui.TextInput(
-        label="Мин. зарплата", placeholder="200", default="200", required=True, max_length=8,
-    )
-    work_max = discord.ui.TextInput(
-        label="Макс. зарплата", placeholder="700", default="700", required=True, max_length=8,
-    )
-    crime_success = discord.ui.TextInput(
-        label="Шанс криминала (0.0 - 1.0)", placeholder="0.60", default="0.60",
-        required=True, max_length=6,
-    )
-    rob_success = discord.ui.TextInput(
-        label="Шанс ограбления (0.0 - 1.0)", placeholder="0.45", default="0.45",
-        required=True, max_length=6,
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            tax = float(self.tax_rate.value)
-            cs = float(self.crime_success.value)
-            rs = float(self.rob_success.value)
-            wmin = int(self.work_min.value)
-            wmax = int(self.work_max.value)
-        except ValueError:
-            return await interaction.response.send_message(
-                "❌ Неверный формат. Налог/шансы — числа 0.0-1.0, зарплата — целые.", ephemeral=True
-            )
-        if not (0.0 <= tax <= 1.0 and 0.0 <= cs <= 1.0 and 0.0 <= rs <= 1.0):
-            return await interaction.response.send_message(
-                "❌ Налог и шансы должны быть в диапазоне 0.0 - 1.0.", ephemeral=True
-            )
-        if wmin < 0 or wmax < wmin:
-            return await interaction.response.send_message(
-                "❌ Проверь зарплату: мин ≥ 0, макс ≥ мин.", ephemeral=True
-            )
-        await self.bot.settings.update_one(
-            {"_id": self.guild_id},
-            {"$set": {
-                "preset": "custom",
-                "tax_rate": tax,
-                "work_min": wmin,
-                "work_max": wmax,
-                "crime_success": cs,
-                "rob_success": rs,
-                "updated_at": now(),
-            }},
-            upsert=True,
-        )
-        settings = await self.bot.get_guild_settings(self.guild_id)
-        embed = SettingsView.build_embed(settings, "custom")
-        await interaction.response.send_message("✅ Кастомные настройки сохранены.", ephemeral=True)
-
-
-class SettingsView(discord.ui.View):
-    def __init__(self, cog, guild_id: int):
-        super().__init__(timeout=180)
-        self.cog = cog
-        self.guild_id = guild_id
-        self.add_item(PresetSelect())
-
-    @staticmethod
-    def build_embed(settings: GuildSettings, preset_name: str) -> discord.Embed:
-        preset = PRESETS.get(preset_name, PRESETS[DEFAULT_PRESET])
-        cw = settings.cooldown("work")
-        cc = settings.cooldown("crime")
-        cs = settings.cooldown("slut")
-        cr = settings.cooldown("rob")
-        cd = settings.cooldown("daily")
-        embed = discord.Embed(
-            title=f"⚙️ Настройки сервера — {preset.get('label', preset_name)}",
-            description="Выбери пресет ниже или настрой вручную.",
-            color=discord.Color.blurple(),
-        )
-        embed.add_field(
-            name="⏱ Кулдауны",
-            value=(
-                f"Work: `{fmt_duration(cw) if cw else 'нет'}`\n"
-                f"Crime: `{fmt_duration(cc) if cc else 'нет'}`\n"
-                f"Slut: `{fmt_duration(cs) if cs else 'нет'}`\n"
-                f"Rob: `{fmt_duration(cr) if cr else 'нет'}`\n"
-                f"Daily: `{fmt_duration(cd) if cd else 'нет'}`"
-            ),
-            inline=True,
-        )
-        embed.add_field(
-            name="🎲 Шансы",
-            value=(
-                f"Криминал: `{settings.crime_success * 100:.0f}%`\n"
-                f"Ограбление: `{settings.rob_success * 100:.0f}%`"
-            ),
-            inline=True,
-        )
-        embed.add_field(
-            name="💰 Экономика",
-            value=(
-                f"Налог: `{settings.tax_rate * 100:.0f}%`\n"
-                f"Зарплата: `{settings.work_range[0]}–{settings.work_range[1]}`\n"
-                f"Кредит: `{settings.loan_interest * 100:.0f}%`\n"
-                f"Просрочка: `{settings.loan_overdue_penalty * 100:.0f}%/сутки`"
-            ),
-            inline=False,
-        )
-        embed.set_footer(text=f"Пресет: {preset_name}")
-        return embed
-
-
-class SettingsCog(commands.Cog):
-    def __init__(self, bot: EconomyBot):
-        self.bot = bot
-
-    def build_embed(self, settings: GuildSettings, preset_name: str) -> discord.Embed:
-        return SettingsView.build_embed(settings, preset_name)
-
-    @app_commands.command(name="settings", description="Настройки экономики сервера (админ)")
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.guild_only()
-    async def settings_cmd(self, interaction: discord.Interaction):
-        settings = await self.bot.get_guild_settings(interaction.guild.id)
-        embed = self.build_embed(settings, settings.preset)
-        view = SettingsView(self, interaction.guild.id)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-    @commands.hybrid_command(name="preset", description="Быстро применить пресет (админ)")
-    @commands.has_permissions(administrator=True)
-    @commands.guild_only()
-    async def preset_cmd(self, ctx, name: Literal["light", "standard", "hardcore"]):
-        settings = await self.bot.save_preset(ctx.guild.id, name)
-        embed = self.build_embed(settings, name)
-        await safe_send(ctx, embed=embed)
-
-
-# =============================================================================
-# EconomyCog — обновлённый, читает параметры из GuildSettings
+# Экономика
 # =============================================================================
 CRIME_ACTIONS = {
     "crime": {
         "title": "🕵️ Кража",
         "reward": CRIME_REWARD,
-        "win": ["Ты тихо вскрыл склад и ушёл незамеченным.",
-                "Охрана смотрела футбол — ты вынес всё, что плохо лежало.",
-                "Карманная кража в метро прошла идеально."],
-        "lose": ["Тебя поймала охрана и вызвала полицию.",
-                 "Сработала сигнализация — пришлось бежать, но тебя опознали.",
-                 "Жертва оказалась переодетым полицейским."],
+        "win": [
+            "Ты тихо вскрыл склад и ушёл незамеченным.",
+            "Охрана смотрела футбол — ты вынес всё, что плохо лежало.",
+            "Карманная кража в метро прошла идеально.",
+        ],
+        "lose": [
+            "Тебя поймала охрана и вызвала полицию.",
+            "Сработала сигнализация — пришлось бежать, но тебя опознали.",
+            "Жертва оказалась переодетым полицейским.",
+        ],
         "wait": "Полиция ещё ищет тебя после прошлого дела.",
         "reason_win": "Кража: добыча",
         "reason_fine": "Штраф за неудачную кражу",
@@ -1191,12 +1133,16 @@ CRIME_ACTIONS = {
     "slut": {
         "title": "💋 Ночная подработка",
         "reward": SLUT_REWARD,
-        "win": ["Клиент оказался щедрым и оставил хорошие чаевые.",
-                "Вечер удался — смена принесла отличный заработок.",
-                "VIP-гость заплатил вдвое больше обычного."],
-        "lose": ["Нагрянула облава — пришлось платить штраф.",
-                 "Клиент сбежал, не заплатив, а тебя ещё и оштрафовали.",
-                 "Конкуренты вызвали проверку, и ты попал под штраф."],
+        "win": [
+            "Клиент оказался щедрым и оставил хорошие чаевые.",
+            "Вечер удался — смена принесла отличный заработок.",
+            "VIP-гость заплатил вдвое больше обычного.",
+        ],
+        "lose": [
+            "Нагрянула облава — пришлось платить штраф.",
+            "Клиент сбежал, не заплатив, а тебя ещё и оштрафовали.",
+            "Конкуренты вызвали проверку, и ты попал под штраф.",
+        ],
         "wait": "Ты ещё не отдохнул после прошлой смены.",
         "reason_win": "Ночная подработка: доход",
         "reason_fine": "Штраф за неудачную ночную подработку",
@@ -1208,22 +1154,27 @@ class EconomyCog(commands.Cog):
     def __init__(self, bot: EconomyBot):
         self.bot = bot
 
-    async def _settings(self, ctx) -> GuildSettings:
-        return await self.bot.get_guild_settings(ctx.guild.id)
-
     @commands.hybrid_command(name="help", description="Команды экономики")
     async def help_command(self, ctx):
         await safe_send(
             ctx,
-            "**Экономика / Центральный банк**\n"
+            "**Экономика сервера** (баланс у каждого сервера свой)\n"
             "`!balance` — баланс; `!pay @user сумма` — перевод\n"
-            "`!work`, `!crime`, `!slut`, `!daily` — заработок; `!rob @user` — ограбить\n"
-            "`!deposit сумма|all`, `!withdraw сумма|all` — банк\n"
-            "`!business buy|status|upgrade`, `!loan take|pay`, `!top`\n"
-            "`!cb`, `!economy` — состояние системы\n"
-            "**Казино:** `!slot`, `!bj`, `!rr`, `!casinostats`\n"
-            "**Админ:** `/settings` — пресеты и кастомные настройки; `/graphs`; "
-            "`/setreportchannel`, `/setchartchannel`"
+            "`!work`, `!crime`, `!slut`, `!daily` — заработок; `!rob @user` — ограбить игрока; `!top` — топ-10\n"
+            "`!deposit сумма|all`, `!withdraw сумма|all` — положить в банк / снять наличные\n"
+            "`!business buy` — купить бизнес; `!business status` — статус\n"
+            "`!business upgrade` — улучшить бизнес (оплата с банковского счёта)\n"
+            "`!loan take сумма`; `!loan pay сумма` — кредит и погашение\n"
+            "`!economy` — статистика сервера; `!cb` — Центральный банк (общий для всех серверов)\n"
+            "**Казино** (ставки из наличных):\n"
+            f"`!slot ставка`, `!bj ставка`, `!rr ставка` (от {fmt(CASINO_MIN_BET)} до {fmt(CASINO_MAX_BET)}, можно `all`)\n"
+            "`!casinostats [@user]` — статистика казино\n"
+            "**Админ:**\n"
+            "`/settings` — панель настроек экономики (пресеты и ручная настройка)\n"
+            "`/graphs` или `!graphs` — графики\n"
+            "`/setreportchannel`, `/setchartchannel` — каналы отчётов и графиков\n"
+            "`!setcooldown work|crime|slut|daily|rob секунды` — кулдаун команды\n"
+            "`!ai_report` — ИИ-отчёт; `!ai_toggle` — вкл/выкл ИИ на сервере"
         )
 
     @commands.hybrid_command(name="balance", description="Показать баланс")
@@ -1238,6 +1189,7 @@ class EconomyCog(commands.Cog):
         await safe_send(ctx, embed=embed)
 
     @commands.hybrid_command(name="pay", description="Перевести наличные игроку")
+    @app_commands.describe(member="Кому перевести", amount="Сумма перевода")
     async def pay(self, ctx, member: discord.Member, amount: int):
         if member.bot:
             return await safe_send(ctx, "❌ Нельзя переводить деньги ботам.")
@@ -1246,43 +1198,43 @@ class EconomyCog(commands.Cog):
 
     @commands.hybrid_command(name="work", description="Поработать и получить зарплату")
     async def work(self, ctx):
-        uid = ctx.author.id
-        gid = ctx.guild.id
-        settings = await self._settings(ctx)
-        cooldown = settings.cooldown("work")
-        wmin, wmax = settings.work_range
-        tax_rate = settings.tax_rate
-        gross = random.randint(wmin, wmax)
+        gid, uid = ctx.guild.id, ctx.author.id
         await self.bot.ensure_user(gid, uid)
+        cfg = await self.bot.get_settings(gid)
+        cooldown = cfg["cooldown_work"]
+        low, high = sorted((cfg["work_min"], cfg["work_max"]))
+        gross = random.randint(low, high)
         try:
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
+                    # Атомарная проверка кулдауна ($or в фильтре): гонка двух команд невозможна.
                     if not await self.bot.claim_cooldown(gid, uid, "work", cooldown, session=session):
                         raise CooldownError("cooldown")
                     _, tax, net = await self.bot.pay_earning(
-                        gid, uid, gross, tax_rate, "Зарплата за работу", session=session
-                    )
+                        gid, uid, gross, "Зарплата за работу",
+                        tax_rate=cfg["tax_rate"], session=session)
         except CooldownError:
             remaining = await self.bot.cooldown_left(gid, uid, "work", cooldown)
-            return await safe_send(ctx, f"⏳ Ты устал. Следующая работа через **{fmt_duration(remaining)}**.")
-        await safe_send(
-            ctx,
-            f"🛠️ Ты заработал **{fmt(gross)}** монет.\n"
-            f"НДФЛ ({tax_rate * 100:.0f}%): **{fmt(tax)}** в госбюджет.\n"
-            f"На руки: **{fmt(net)}** монет."
-        )
+            return await safe_send(
+                ctx, f"⏳ Ты устал. Следующая работа через **{fmt_duration(remaining)}**.")
+        text = f"🛠️ Ты заработал **{fmt(gross)}** монет.\n"
+        if tax > 0:
+            text += f"НДФЛ ({fmt_pct(cfg['tax_rate'])}): **{fmt(tax)}** в госбюджет.\n"
+        text += f"На руки: **{fmt(net)}** монет."
+        await safe_send(ctx, text)
 
     async def _criminal_action(self, ctx, key: str):
-        cfg = CRIME_ACTIONS[key]
-        uid = ctx.author.id
-        gid = ctx.guild.id
-        settings = await self._settings(ctx)
-        cooldown = settings.cooldown(key)
-        success_chance = settings.crime_success
-        success = rng.random() < success_chance
-        reward = rng.randint(*cfg["reward"])
-        fine = 0
+        """Общая логика !crime и !slut. Успех (шанс crime_chance из настроек сервера): награда из
+        резерва ЦБ без НДФЛ. Провал: штраф min(20% баланса, 500) в госбюджет. Любая ошибка
+        (в т.ч. нехватка резерва) откатывает транзакцию вместе с кулдауном."""
+        cfg_action = CRIME_ACTIONS[key]
+        gid, uid = ctx.guild.id, ctx.author.id
         await self.bot.ensure_user(gid, uid)
+        cfg = await self.bot.get_settings(gid)
+        cooldown = cfg[f"cooldown_{key}"]
+        success = rng.random() < cfg["crime_chance"]
+        reward = rng.randint(*cfg_action["reward"])
+        fine = 0
         try:
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
@@ -1290,90 +1242,171 @@ class EconomyCog(commands.Cog):
                         raise CooldownError("cooldown")
                     if success:
                         if not await self.bot.change_reserve(-reward, session=session):
-                            raise EconomyError("В резерве ЦБ недостаточно средств.")
+                            raise EconomyError(
+                                "В резерве ЦБ недостаточно средств. Попроси админа сделать эмиссию.")
                         await self.bot.change_cash(gid, uid, reward, session=session)
-                        await self.bot.journal(
-                            "central_bank", f"user_{gid}_{uid}", reward,
-                            cfg["reason_win"], {"type": key, "guild_id": gid}, session=session
-                        )
+                        await self.bot.journal("central_bank", f"user_{uid}", reward,
+                                               cfg_action["reason_win"], {"type": key},
+                                               session=session, guild_id=gid)
                     else:
-                        user = await self.bot.db_users.find_one(
-                            {"guild_id": gid, "user_id": uid}, session=session
-                        ) or {}
+                        user = await self.bot.db_users.find_one(ukey(gid, uid), session=session) or {}
                         cash, bank = int(user.get("cash", 0)), int(user.get("bank", 0))
                         fine = min(int((cash + bank) * CRIME_FINE_RATE), CRIME_FINE_MAX)
                         if fine > 0:
                             from_cash = min(fine, cash)
                             from_bank = fine - from_cash
                             debited = await self.bot.db_users.update_one(
-                                {"guild_id": gid, "user_id": uid,
-                                 "cash": {"$gte": from_cash}, "bank": {"$gte": from_bank}},
+                                {**ukey(gid, uid), "cash": {"$gte": from_cash}, "bank": {"$gte": from_bank}},
                                 {"$inc": {"cash": -from_cash, "bank": -from_bank},
                                  "$set": {"updated_at": now()}},
                                 session=session,
                             )
                             if debited.modified_count != 1:
-                                raise EconomyError("Баланс изменился. Попробуй ещё раз.")
-                            await self.bot.add_budget(
-                                fine, cfg["reason_fine"], session=session,
-                                source=f"user_{gid}_{uid}"
-                            )
+                                raise EconomyError("Баланс изменился во время операции. Попробуй ещё раз.")
+                            await self.bot.add_budget(fine, cfg_action["reason_fine"], session=session,
+                                                      source=f"user_{uid}", guild_id=gid)
         except CooldownError:
             remaining = await self.bot.cooldown_left(gid, uid, key, cooldown)
             return await safe_send(
-                ctx, f"⏳ {cfg['wait']} Попробуй через **{fmt_duration(remaining)}**."
-            )
+                ctx, f"⏳ {cfg_action['wait']} Попробуй через **{fmt_duration(remaining)}**.")
         except EconomyError as e:
             return await safe_send(ctx, f"❌ {e}")
 
         if success:
-            await safe_send(ctx, f"{cfg['title']}\n{rng.choice(cfg['win'])}\n"
-                                  f"💰 Добыча: **{fmt(reward)}** монет (без налога).")
+            await safe_send(
+                ctx,
+                f"{cfg_action['title']}\n{rng.choice(cfg_action['win'])}\n"
+                f"💰 Добыча: **{fmt(reward)}** монет (без налога)."
+            )
         elif fine > 0:
-            await safe_send(ctx, f"{cfg['title']}\n{rng.choice(cfg['lose'])}\n"
-                                  f"🚔 Штраф: **{fmt(fine)}** монет в госбюджет.")
+            await safe_send(
+                ctx,
+                f"{cfg_action['title']}\n{rng.choice(cfg_action['lose'])}\n"
+                f"🚔 Штраф: **{fmt(fine)}** монет уходит в госбюджет."
+            )
         else:
-            await safe_send(ctx, f"{cfg['title']}\n{rng.choice(cfg['lose'])}\n"
-                                  "🚔 Штраф 0.")
+            await safe_send(
+                ctx,
+                f"{cfg_action['title']}\n{rng.choice(cfg_action['lose'])}\n"
+                "🚔 У тебя нечего отбирать — штраф 0."
+            )
 
-    @commands.hybrid_command(name="crime", description="Кража")
+    @commands.hybrid_command(name="crime", description="Кража: награда из резерва ЦБ, шанс зависит от настроек сервера")
     async def crime(self, ctx):
         await self._criminal_action(ctx, "crime")
 
-    @commands.hybrid_command(name="slut", description="Ночная подработка")
+    @commands.hybrid_command(name="slut", description="Ночная подработка: награда из резерва ЦБ, шанс зависит от настроек сервера")
     async def slut(self, ctx):
         await self._criminal_action(ctx, "slut")
 
-    @commands.hybrid_command(name="daily", description="Ежедневный бонус")
+    @commands.hybrid_command(name="daily", description="Ежедневный бонус из резерва ЦБ")
     async def daily(self, ctx):
-        uid = ctx.author.id
-        gid = ctx.guild.id
-        settings = await self._settings(ctx)
-        cooldown = settings.cooldown("daily")
-        reward = rng.randint(*DAILY_REWARD)
+        gid, uid = ctx.guild.id, ctx.author.id
         await self.bot.ensure_user(gid, uid)
+        cfg = await self.bot.get_settings(gid)
+        cooldown = cfg["cooldown_daily"]
+        low, high = sorted((cfg["daily_min"], cfg["daily_max"]))
+        reward = rng.randint(low, high)
         try:
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
                     if not await self.bot.claim_cooldown(gid, uid, "daily", cooldown, session=session):
                         raise CooldownError("cooldown")
-                    if not await self.bot.change_reserve(-reward, session=session):
-                        raise EconomyError("В резерве ЦБ недостаточно средств.")
-                    await self.bot.change_cash(gid, uid, reward, session=session)
-                    await self.bot.journal(
-                        "central_bank", f"user_{gid}_{uid}", reward,
-                        "Ежедневный бонус", {"type": "daily", "guild_id": gid}, session=session
-                    )
+                    if reward > 0:
+                        if not await self.bot.change_reserve(-reward, session=session):
+                            raise EconomyError("В резерве ЦБ недостаточно средств. Попроси админа сделать эмиссию.")
+                        await self.bot.change_cash(gid, uid, reward, session=session)
+                        await self.bot.journal("central_bank", f"user_{uid}", reward,
+                                               "Ежедневный бонус", {"type": "daily"},
+                                               session=session, guild_id=gid)
         except CooldownError:
             remaining = await self.bot.cooldown_left(gid, uid, "daily", cooldown)
             return await safe_send(ctx, f"⏳ Бонус уже получен. Следующий через **{fmt_duration(remaining)}**.")
         except EconomyError as e:
             return await safe_send(ctx, f"❌ {e}")
-        await safe_send(ctx, f"🎁 Ежедневный бонус: **{fmt(reward)}** монет.")
+        await safe_send(ctx, f"🎁 Ежедневный бонус: **{fmt(reward)}** монет (без налога).")
+
+    @commands.hybrid_command(name="rob", description="Ограбить игрока: при провале — штраф в пользу жертвы")
+    @app_commands.describe(member="Кого грабим")
+    async def rob(self, ctx, member: discord.Member):
+        gid, uid, tid = ctx.guild.id, ctx.author.id, member.id
+        if member.bot or tid == uid:
+            return await safe_send(ctx, "❌ Нельзя грабить себя или ботов.")
+        await self.bot.ensure_user(gid, uid)
+        await self.bot.ensure_user(gid, tid)
+        cfg = await self.bot.get_settings(gid)
+        cooldown = cfg["cooldown_rob"]
+        success = rng.random() < cfg["rob_chance"]
+        loot_rate = rng.uniform(*ROB_LOOT_RATE)
+        amount = 0
+        try:
+            async with await self.bot.mongo.start_session() as session:
+                async with session.start_transaction():
+                    if not await self.bot.claim_cooldown(gid, uid, "rob", cooldown, session=session):
+                        raise CooldownError("cooldown")
+                    victim = await self.bot.db_users.find_one(ukey(gid, tid), session=session) or {}
+                    vcash = int(victim.get("cash", 0))
+                    if vcash < ROB_MIN_TARGET_CASH:
+                        raise EconomyError(
+                            f"У {member.display_name} меньше {fmt(ROB_MIN_TARGET_CASH)} наличных — не стоит рисковать.")
+                    robbed_at = as_utc(victim.get("last_robbed"))
+                    if robbed_at and (now() - robbed_at).total_seconds() < ROB_VICTIM_PROTECTION:
+                        left = ROB_VICTIM_PROTECTION - (now() - robbed_at).total_seconds()
+                        raise EconomyError(
+                            f"{member.display_name} недавно ограбили. Защита ещё {fmt_duration(left)}.")
+                    if success:
+                        amount = max(1, min(int(vcash * loot_rate), ROB_MAX_LOOT))
+                        taken = await self.bot.db_users.update_one(
+                            {**ukey(gid, tid), "cash": {"$gte": amount}},
+                            {"$inc": {"cash": -amount}, "$set": {"last_robbed": now(), "updated_at": now()}},
+                            session=session,
+                        )
+                        if taken.modified_count != 1:
+                            raise EconomyError("Баланс жертвы изменился. Попробуй ещё раз.")
+                        await self.bot.change_cash(gid, uid, amount, session=session)
+                        await self.bot.journal(f"user_{tid}", f"user_{uid}", amount,
+                                               "Ограбление", {"type": "rob"},
+                                               session=session, guild_id=gid)
+                    else:
+                        thief = await self.bot.db_users.find_one(ukey(gid, uid), session=session) or {}
+                        amount = min(int(int(thief.get("cash", 0)) * ROB_FINE_RATE), ROB_FINE_MAX)
+                        if amount > 0:
+                            if not await self.bot.change_cash(gid, uid, -amount, session=session):
+                                raise EconomyError("Баланс изменился. Попробуй ещё раз.")
+                            await self.bot.change_cash(gid, tid, amount, session=session)
+                            await self.bot.journal(f"user_{uid}", f"user_{tid}", amount,
+                                                   "Штраф за неудачное ограбление", {"type": "rob_fail"},
+                                                   session=session, guild_id=gid)
+        except CooldownError:
+            remaining = await self.bot.cooldown_left(gid, uid, "rob", cooldown)
+            return await safe_send(ctx, f"⏳ Копы ещё рядом. Попробуй через **{fmt_duration(remaining)}**.")
+        except EconomyError as e:
+            return await safe_send(ctx, f"❌ {e}")
+        if success:
+            await safe_send(ctx, f"🥷 Ты ограбил {member.mention} на **{fmt(amount)}** монет (без налога).")
+        elif amount > 0:
+            await safe_send(ctx, f"🚔 Тебя поймали! Ты выплатил {member.mention} компенсацию: **{fmt(amount)}** монет.")
+        else:
+            await safe_send(ctx, "🚔 Тебя поймали, но с тебя нечего взять — штраф 0.")
+
+    @commands.hybrid_command(name="setcooldown", description="Задать кулдаун команды на этом сервере (админ)")
+    @commands.has_permissions(administrator=True)
+    @commands.guild_only()
+    @app_commands.describe(command="Команда: work, crime, slut, daily или rob", seconds="Кулдаун в секундах (0 — без кулдауна)")
+    async def setcooldown(self, ctx, command: Literal["work", "crime", "slut", "daily", "rob"], seconds: int):
+        if seconds < 0 or seconds > COOLDOWN_MAX:
+            return await safe_send(ctx, f"❌ Кулдаун должен быть от 0 до {fmt(COOLDOWN_MAX)} секунд.")
+        await self.bot.settings.update_one(
+            {"_id": ctx.guild.id},
+            {"$set": {f"eco.cooldown_{command}": int(seconds), "eco.preset": "custom", "updated_at": now()}},
+            upsert=True,
+        )
+        self.bot.invalidate_settings(ctx.guild.id)
+        text = "без кулдауна" if seconds == 0 else fmt_duration(seconds)
+        await safe_send(ctx, f"✅ Кулдаун `{command}` теперь: **{text}** (пресет: ⚙️ Кастомная).")
 
     async def _move_money(self, ctx, raw_amount: str, *, to_bank: bool):
-        uid = ctx.author.id
-        gid = ctx.guild.id
+        gid, uid = ctx.guild.id, ctx.author.id
         user = await self.bot.ensure_user(gid, uid)
         src = "cash" if to_bank else "bank"
         amount = parse_amount(raw_amount, int(user.get(src, 0)))
@@ -1383,7 +1416,7 @@ class EconomyCog(commands.Cog):
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
                     moved = await self.bot.db_users.update_one(
-                        {"guild_id": gid, "user_id": uid, src: {"$gte": amount}},
+                        {**ukey(gid, uid), src: {"$gte": amount}},
                         {"$inc": {"cash": -amount if to_bank else amount,
                                   "bank": amount if to_bank else -amount},
                          "$set": {"updated_at": now()}},
@@ -1392,117 +1425,38 @@ class EconomyCog(commands.Cog):
                     if moved.modified_count != 1:
                         raise EconomyError("Недостаточно средств на счёте.")
                     await self.bot.journal(
-                        f"user_{gid}_{uid}_{src}",
-                        f"user_{gid}_{uid}_{'bank' if to_bank else 'cash'}",
-                        amount,
-                        "Пополнение банка" if to_bank else "Снятие наличных",
-                        {"type": "deposit" if to_bank else "withdraw", "guild_id": gid},
-                        session=session
-                    )
+                        f"user_{uid}_{src}", f"user_{uid}_{'bank' if to_bank else 'cash'}", amount,
+                        "Пополнение банковского счёта" if to_bank else "Снятие наличных",
+                        {"type": "deposit" if to_bank else "withdraw"}, session=session, guild_id=gid)
         except EconomyError as e:
             return await safe_send(ctx, f"❌ {e}")
         await safe_send(ctx, f"{'🏦 В банк' if to_bank else '💵 Снято'}: **{fmt(amount)}** монет.")
 
-    @commands.hybrid_command(name="deposit", aliases=["dep"], description="Положить в банк")
+    @commands.hybrid_command(name="deposit", aliases=["dep"], description="Положить наличные в банк")
+    @app_commands.describe(amount="Сумма или all")
     async def deposit(self, ctx, amount: str):
         await self._move_money(ctx, amount, to_bank=True)
 
-    @commands.hybrid_command(name="withdraw", aliases=["with"], description="Снять из банка")
+    @commands.hybrid_command(name="withdraw", aliases=["with"], description="Снять деньги с банковского счёта")
+    @app_commands.describe(amount="Сумма или all")
     async def withdraw(self, ctx, amount: str):
         await self._move_money(ctx, amount, to_bank=False)
 
-    @commands.hybrid_command(name="rob", description="Ограбить игрока")
-    @commands.guild_only()
-    async def rob(self, ctx, member: discord.Member):
-        gid = ctx.guild.id
-        uid, tid = ctx.author.id, member.id
-        if member.bot or tid == uid:
-            return await safe_send(ctx, "❌ Нельзя грабить себя или ботов.")
-        settings = await self._settings(ctx)
-        cooldown = settings.cooldown("rob")
-        success_chance = settings.rob_success
-        await self.bot.ensure_user(gid, uid)
-        await self.bot.ensure_user(gid, tid)
-        success = rng.random() < success_chance
-        loot_rate = rng.uniform(*ROB_LOOT_RATE)
-        amount = 0
-        try:
-            async with await self.bot.mongo.start_session() as session:
-                async with session.start_transaction():
-                    if not await self.bot.claim_cooldown(gid, uid, "rob", cooldown, session=session):
-                        raise CooldownError("cooldown")
-                    victim = await self.bot.db_users.find_one(
-                        {"guild_id": gid, "user_id": tid}, session=session
-                    ) or {}
-                    vcash = int(victim.get("cash", 0))
-                    if vcash < ROB_MIN_TARGET_CASH:
-                        raise EconomyError(
-                            f"У {member.display_name} меньше {fmt(ROB_MIN_TARGET_CASH)} наличных."
-                        )
-                    robbed_at = as_utc(victim.get("last_robbed"))
-                    if robbed_at and (now() - robbed_at).total_seconds() < ROB_VICTIM_PROTECTION:
-                        left = ROB_VICTIM_PROTECTION - (now() - robbed_at).total_seconds()
-                        raise EconomyError(
-                            f"{member.display_name} недавно ограбили. Защита ещё {fmt_duration(left)}."
-                        )
-                    if success:
-                        amount = max(1, min(int(vcash * loot_rate), ROB_MAX_LOOT))
-                        taken = await self.bot.db_users.update_one(
-                            {"guild_id": gid, "user_id": tid, "cash": {"$gte": amount}},
-                            {"$inc": {"cash": -amount},
-                             "$set": {"last_robbed": now(), "updated_at": now()}},
-                            session=session,
-                        )
-                        if taken.modified_count != 1:
-                            raise EconomyError("Баланс жертвы изменился. Попробуй ещё раз.")
-                        await self.bot.change_cash(gid, uid, amount, session=session)
-                        await self.bot.journal(
-                            f"user_{gid}_{tid}", f"user_{gid}_{uid}", amount,
-                            "Ограбление", {"type": "rob", "guild_id": gid}, session=session
-                        )
-                    else:
-                        thief = await self.bot.db_users.find_one(
-                            {"guild_id": gid, "user_id": uid}, session=session
-                        ) or {}
-                        amount = min(int(int(thief.get("cash", 0)) * ROB_FINE_RATE), ROB_FINE_MAX)
-                        if amount > 0:
-                            paid = await self.bot.change_cash(gid, uid, -amount, session=session)
-                            if not paid:
-                                raise EconomyError("Баланс изменился. Попробуй ещё раз.")
-                            await self.bot.change_cash(gid, tid, amount, session=session)
-                            await self.bot.journal(
-                                f"user_{gid}_{uid}", f"user_{gid}_{tid}", amount,
-                                "Штраф за неудачное ограбление",
-                                {"type": "rob_fail", "guild_id": gid}, session=session
-                            )
-        except CooldownError:
-            remaining = await self.bot.cooldown_left(gid, uid, "rob", cooldown)
-            return await safe_send(ctx, f"⏳ Копы рядом. Попробуй через **{fmt_duration(remaining)}**.")
-        except EconomyError as e:
-            return await safe_send(ctx, f"❌ {e}")
-        if success:
-            await safe_send(ctx, f"🥷 Ты ограбил {member.mention} на **{fmt(amount)}** монет.")
-        elif amount > 0:
-            await safe_send(ctx, f"🚔 Поймали! Компенсация {member.mention}: **{fmt(amount)}** монет.")
-        else:
-            await safe_send(ctx, "🚔 Поймали, но взять нечего — штраф 0.")
-
     @commands.hybrid_command(name="top", description="Топ-10 богатейших игроков сервера")
     async def top(self, ctx):
-        gid = ctx.guild.id
         rows = await self.bot.db_users.aggregate([
-            {"$match": {"guild_id": gid}},
+            {"$match": {"guild_id": ctx.guild.id}},
             {"$addFields": {"net": {"$subtract": [
                 {"$add": [{"$ifNull": ["$cash", 0]}, {"$ifNull": ["$bank", 0]}]},
-                {"$ifNull": ["$debt", 0]}
-            ]}}},
+                {"$ifNull": ["$debt", 0]}]}}},
             {"$sort": {"net": -1}},
             {"$limit": 10},
         ]).to_list(10)
         lines = []
         for i, row in enumerate(rows, 1):
-            member = ctx.guild.get_member(int(row["user_id"]))
-            name = member.display_name if member else f"ID {row['user_id']}"
+            uid = int(row["user_id"])
+            member = ctx.guild.get_member(uid)
+            name = member.display_name if member else f"ID {uid}"
             lines.append(f"**{i}.** {name} — `{fmt(row['net'])}`")
         embed = discord.Embed(
             title="🏆 Топ-10 экономики",
@@ -1511,301 +1465,299 @@ class EconomyCog(commands.Cog):
         )
         await safe_send(ctx, embed=embed)
 
-    # --- Бизнес (мультисерверный) -------------------------------------------
-    @commands.hybrid_group(name="business", description="Управление бизнесом", invoke_without_command=True)
-    async def business(self, ctx):
-        doc = await self.bot.businesses.find_one({"guild_id": ctx.guild.id, "user_id": ctx.author.id})
-        if not doc:
-            return await safe_send(ctx, "У тебя пока нет бизнеса. Используй `!business buy`.")
-        await safe_send(ctx, self._business_text(doc))
-
+    # --- Бизнес --------------------------------------------------------------
     @staticmethod
-    def _business_text(doc):
+    def _business_text(doc, tax_rate):
         level = int(doc.get("level", 1))
         state = "заморожен" if doc.get("frozen") else "работает"
         text = (
             f"🏢 Бизнес: уровень `{level}`/{BUSINESS_MAX_LEVEL}, статус: **{state}**.\n"
             f"Доход: `{fmt(business_income(level))}`/час; "
-            f"налог: `{fmt(business_tax(level))}`/час (5%)."
+            f"налог: `{fmt(business_tax(level, tax_rate))}`/час из наличных ({fmt_pct(tax_rate)} дохода)."
         )
         if level < BUSINESS_MAX_LEVEL:
-            text += (f"\nУлучшение до {level + 1}: `{fmt(upgrade_cost(level))}` "
-                     f"с банка (`!business upgrade`).")
+            text += (f"\nУлучшение до уровня {level + 1}: `{fmt(upgrade_cost(level))}` "
+                     f"с банковского счёта (`!business upgrade`).")
         else:
-            text += "\nМаксимальный уровень."
+            text += "\nДостигнут максимальный уровень."
         return text
+
+    @commands.hybrid_group(name="business", description="Управление бизнесом", invoke_without_command=True)
+    async def business(self, ctx):
+        await self._show_business(ctx)
 
     @business.command(name="buy", description="Купить бизнес")
     async def business_buy(self, ctx):
-        gid = ctx.guild.id
-        uid = ctx.author.id
+        gid, uid = ctx.guild.id, ctx.author.id
         user = await self.bot.ensure_user(gid, uid)
         if int(user.get("debt", 0)) > 0:
-            return await safe_send(ctx, "❌ Сначала погаси долг.")
-        if await self.bot.businesses.find_one({"guild_id": gid, "user_id": uid}):
+            return await safe_send(ctx, "❌ Сначала полностью погаси долг, затем покупай бизнес.")
+        if await self.bot.businesses.find_one(ukey(gid, uid)):
             return await safe_send(ctx, "❌ У тебя уже есть бизнес.")
         try:
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
                     result = await self.bot.db_users.update_one(
-                        {"guild_id": gid, "user_id": uid, "cash": {"$gte": BUSINESS_COST}, "debt": 0},
+                        {**ukey(gid, uid), "cash": {"$gte": BUSINESS_COST}, "debt": 0},
                         {"$inc": {"cash": -BUSINESS_COST}, "$set": {"updated_at": now()}},
                         session=session,
                     )
                     if result.modified_count != 1:
                         raise EconomyError(f"Нужно {fmt(BUSINESS_COST)} наличными и отсутствие долга.")
-                    await self.bot.businesses.insert_one({
-                        "guild_id": gid, "user_id": uid, "level": 1,
-                        "last_payout": now(), "frozen": False, "created_at": now(),
-                    }, session=session)
-                    await self.bot.journal(
-                        f"user_{gid}_{uid}", "business_market", BUSINESS_COST,
-                        "Покупка бизнеса", {"guild_id": gid}, session=session
-                    )
+                    try:
+                        await self.bot.businesses.insert_one({
+                            **ukey(gid, uid), "level": 1, "last_payout": now(),
+                            "frozen": False, "created_at": now(),
+                        }, session=session)
+                    except DuplicateKeyError:
+                        raise EconomyError("У тебя уже есть бизнес.")
+                    await self.bot.journal(f"user_{uid}", "business_market", BUSINESS_COST,
+                                           "Покупка бизнеса", session=session, guild_id=gid)
         except EconomyError as e:
             return await safe_send(ctx, f"❌ {e}")
-        await safe_send(ctx, f"✅ Бизнес куплен за **{fmt(BUSINESS_COST)}**.")
+        await safe_send(ctx, f"✅ Бизнес куплен за **{fmt(BUSINESS_COST)}**. Первый доход начислится примерно через час.")
 
     @business.command(name="status", description="Статус бизнеса")
     async def business_status(self, ctx):
-        doc = await self.bot.businesses.find_one({"guild_id": ctx.guild.id, "user_id": ctx.author.id})
-        if not doc:
-            return await safe_send(ctx, "Бизнеса нет. `!business buy`.")
-        await safe_send(ctx, self._business_text(doc))
+        await self._show_business(ctx)
 
-    @business.command(name="upgrade", description="Улучшить бизнес")
-    async def business_upgrade(self, ctx):
+    async def _show_business(self, ctx):
         gid = ctx.guild.id
-        uid = ctx.author.id
+        doc = await self.bot.businesses.find_one(ukey(gid, ctx.author.id))
+        if not doc:
+            return await safe_send(ctx, "У тебя пока нет бизнеса. Используй `!business buy`.")
+        cfg = await self.bot.get_settings(gid)
+        await safe_send(ctx, self._business_text(doc, cfg["business_tax"]))
+
+    @business.command(name="upgrade", description="Улучшить бизнес (+500 монет/час за уровень)")
+    async def business_upgrade(self, ctx):
+        gid, uid = ctx.guild.id, ctx.author.id
         await self.bot.ensure_user(gid, uid)
+        cfg = await self.bot.get_settings(gid)
         try:
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
-                    doc = await self.bot.businesses.find_one(
-                        {"guild_id": gid, "user_id": uid}, session=session
-                    )
+                    doc = await self.bot.businesses.find_one(ukey(gid, uid), session=session)
                     if not doc:
-                        raise EconomyError("Бизнеса нет. `!business buy`.")
+                        raise EconomyError("У тебя пока нет бизнеса. Используй `!business buy`.")
                     level = int(doc.get("level", 1))
                     if level >= BUSINESS_MAX_LEVEL:
-                        raise EconomyError("Максимальный уровень.")
+                        raise EconomyError("Бизнес уже достиг максимального уровня.")
                     cost = upgrade_cost(level)
                     if not await self.bot.change_bank(gid, uid, -cost, session=session):
-                        raise EconomyError(f"Нужно `{fmt(cost)}` на банковском счёте.")
+                        raise EconomyError(f"Для улучшения нужно `{fmt(cost)}` на банковском счёте.")
                     upgraded = await self.bot.businesses.update_one(
-                        {"guild_id": gid, "user_id": uid, "level": level},
+                        {**ukey(gid, uid), "level": level},
                         {"$inc": {"level": 1}, "$set": {"upgraded_at": now()}},
                         session=session,
                     )
                     if upgraded.modified_count != 1:
-                        raise EconomyError("Бизнес изменился. Попробуй ещё раз.")
+                        raise EconomyError("Бизнес изменился во время операции, попробуй ещё раз.")
+                    # Плата за улучшение возвращается в резерв ЦБ.
                     await self.bot.change_reserve(cost, session=session)
-                    await self.bot.journal(
-                        f"user_{gid}_{uid}", "central_bank", cost, "Улучшение бизнеса",
-                        {"from_level": level, "to_level": level + 1, "guild_id": gid},
-                        session=session
-                    )
+                    await self.bot.journal(f"user_{uid}", "central_bank", cost,
+                                           "Улучшение бизнеса",
+                                           {"from_level": level, "to_level": level + 1},
+                                           session=session, guild_id=gid)
         except EconomyError as e:
             return await safe_send(ctx, f"❌ {e}")
         new_level = level + 1
-        await safe_send(ctx, f"⬆️ Уровень **{new_level}** за **{fmt(cost)}**.\n"
-                              f"Доход: `{fmt(business_income(new_level))}`/час.")
+        await safe_send(
+            ctx,
+            f"⬆️ Бизнес улучшен до уровня **{new_level}** за **{fmt(cost)}**.\n"
+            f"Доход: `{fmt(business_income(new_level))}`/час, "
+            f"налог: `{fmt(business_tax(new_level, cfg['business_tax']))}`/час."
+        )
 
     # --- Кредиты -------------------------------------------------------------
     @commands.hybrid_group(name="loan", description="Кредиты", invoke_without_command=True)
     async def loan(self, ctx):
-        data = await self.bot.get_balance(ctx.guild.id, ctx.author.id)
-        settings = await self._settings(ctx)
-        text = f"💳 Твой долг: `{fmt(data['debt'])}`."
+        gid = ctx.guild.id
+        data = await self.bot.get_balance(gid, ctx.author.id)
+        cfg = await self.bot.get_settings(gid)
+        text = f"💳 Твой долг: `{fmt(data['debt'])}`. Используй `!loan take сумма` или `!loan pay сумма`."
         due = as_utc(data.get("loan_due"))
         if int(data.get("debt", 0)) > 0 and due:
             if now() > due:
-                text += f"\n🚨 Просрочено! +{settings.loan_overdue_penalty * 100:.0f}% за сутки."
+                text += "\n🚨 Кредит просрочен."
+                if cfg["loan_penalty"] > 0:
+                    text += (f" К долгу добавляется {fmt_pct(cfg['loan_penalty'])} "
+                             "за каждые сутки просрочки.")
             else:
-                text += f"\n📅 До: <t:{int(due.timestamp())}:f>."
+                text += f"\n📅 Погасить до: <t:{int(due.timestamp())}:f> (<t:{int(due.timestamp())}:R>)."
         await safe_send(ctx, text)
 
-    @loan.command(name="take", description="Взять кредит")
+    @loan.command(name="take", description="Взять кредит из резерва ЦБ")
+    @app_commands.describe(amount="Сумма кредита до начисления процентов")
     async def loan_take(self, ctx, amount: int):
         if amount < LOAN_MIN or amount > LOAN_MAX:
-            return await safe_send(ctx, f"❌ От {fmt(LOAN_MIN)} до {fmt(LOAN_MAX)}.")
-        gid = ctx.guild.id
-        uid = ctx.author.id
-        settings = await self._settings(ctx)
-        interest = settings.loan_interest
+            return await safe_send(ctx, f"❌ Сумма должна быть от {fmt(LOAN_MIN)} до {fmt(LOAN_MAX)}.")
+        gid, uid = ctx.guild.id, ctx.author.id
         user = await self.bot.ensure_user(gid, uid)
         if int(user.get("debt", 0)) > 0:
-            return await safe_send(ctx, "❌ Сначала погаси текущий долг.")
-        owed = int(amount * (1 + interest))
+            return await safe_send(ctx, "❌ Новый кредит недоступен, пока не погашен текущий долг.")
+        cfg = await self.bot.get_settings(gid)
+        owed = int(amount * (1 + cfg["loan_interest"]))
+        due_at = now() + timedelta(seconds=LOAN_TERM)
         try:
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
                     if not await self.bot.change_reserve(-amount, session=session):
                         raise EconomyError("В резерве ЦБ недостаточно средств.")
                     taken = await self.bot.db_users.update_one(
-                        {"guild_id": gid, "user_id": uid, "debt": 0},
+                        {**ukey(gid, uid), "debt": 0},
                         {"$inc": {"cash": amount, "debt": owed},
-                         "$set": {"updated_at": now(), "loan_penalty_at": None,
-                                  "loan_due": now() + timedelta(seconds=LOAN_TERM)}},
+                         "$set": {"updated_at": now(), "loan_penalty_at": None, "loan_due": due_at}},
                         session=session,
                     )
                     if taken.modified_count != 1:
-                        raise EconomyError("Кредит недоступен: есть долг.")
-                    await self.bot.journal(
-                        "central_bank", f"user_{gid}_{uid}", amount,
-                        "Выдача кредита", {"repayment_due": owed, "guild_id": gid},
-                        session=session
-                    )
+                        raise EconomyError("Новый кредит недоступен, пока не погашен текущий долг.")
+                    await self.bot.journal("central_bank", f"user_{uid}", amount,
+                                           "Выдача кредита", {"repayment_due": owed},
+                                           session=session, guild_id=gid)
         except EconomyError as e:
             return await safe_send(ctx, f"❌ {e}")
-        due_ts = int((now() + timedelta(seconds=LOAN_TERM)).timestamp())
-        await safe_send(
-            ctx,
-            f"✅ Получено **{fmt(amount)}**. К погашению: **{fmt(owed)}** "
-            f"({interest * 100:.0f}%).\n📅 До: <t:{due_ts}:f>."
-        )
+        text = (f"✅ Получено **{fmt(amount)}**. К погашению: **{fmt(owed)}** "
+                f"(процент {fmt_pct(cfg['loan_interest'])}).\n"
+                f"📅 Срок: до <t:{int(due_at.timestamp())}:f>.")
+        if cfg["loan_penalty"] > 0:
+            text += f" Просрочка: +{fmt_pct(cfg['loan_penalty'])} к долгу за каждые сутки."
+        await safe_send(ctx, text)
 
-    @loan.command(name="pay", description="Погасить кредит")
+    @loan.command(name="pay", description="Погасить кредит наличными")
+    @app_commands.describe(amount="Сумма погашения")
     async def loan_pay(self, ctx, amount: int):
         if amount <= 0:
-            return await safe_send(ctx, "❌ Сумма положительная.")
-        gid = ctx.guild.id
-        uid = ctx.author.id
+            return await safe_send(ctx, "❌ Сумма должна быть положительной.")
+        gid, uid = ctx.guild.id, ctx.author.id
         user = await self.bot.ensure_user(gid, uid)
         debt = int(user.get("debt", 0))
         if debt <= 0:
-            return await safe_send(ctx, "Долга нет.")
+            return await safe_send(ctx, "У тебя нет долга.")
         payment = min(amount, debt)
         try:
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
+                    # Условный апдейт: ни cash, ни debt не могут уйти в минус.
                     result = await self.bot.db_users.update_one(
-                        {"guild_id": gid, "user_id": uid,
-                         "cash": {"$gte": payment}, "debt": {"$gte": payment}},
-                        {"$inc": {"cash": -payment, "debt": -payment},
-                         "$set": {"updated_at": now()}},
+                        {**ukey(gid, uid), "cash": {"$gte": payment}, "debt": {"$gte": payment}},
+                        {"$inc": {"cash": -payment, "debt": -payment}, "$set": {"updated_at": now()}},
                         session=session,
                     )
                     if result.modified_count != 1:
-                        raise EconomyError("Недостаточно наличных.")
+                        raise EconomyError("Недостаточно наличных для такого платежа.")
                     await self.bot.change_reserve(payment, session=session)
                     if payment >= debt:
                         await self.bot.db_users.update_one(
-                            {"guild_id": gid, "user_id": uid, "debt": 0},
+                            {**ukey(gid, uid), "debt": 0},
                             {"$set": {"loan_due": None, "loan_penalty_at": None}},
                             session=session,
                         )
-                    await self.bot.journal(
-                        f"user_{gid}_{uid}", "central_bank", payment,
-                        "Погашение кредита", {"guild_id": gid}, session=session
-                    )
+                    await self.bot.journal(f"user_{uid}", "central_bank", payment,
+                                           "Погашение кредита", session=session, guild_id=gid)
         except EconomyError as e:
             return await safe_send(ctx, f"❌ {e}")
-        await safe_send(ctx, f"✅ Погашено **{fmt(payment)}**. Остаток: **{fmt(debt - payment)}**.")
+        await safe_send(ctx, f"✅ Погашено **{fmt(payment)}**. Остаток долга: **{fmt(debt - payment)}**.")
 
-    # --- Глобальная экономика (без гильдии) ---------------------------------
-    @commands.hybrid_command(name="cb", description="Состояние Центрального банка")
+    # --- ЦБ (глобальный) -----------------------------------------------------
+    @commands.hybrid_command(name="cb", description="Состояние Центрального банка (общий для всех серверов)")
     async def cb(self, ctx):
-        s = await self.bot.stats(guild_id=ctx.guild.id if ctx.guild else None)
+        s = await self.bot.stats()
         await safe_send(
             ctx,
-            f"🏦 **Центральный банк** (глобальный)\n"
-            f"Резерв: `{fmt(s['reserve'])}`\nФонды: `{fmt(s['funds'])}`\n"
-            f"Госбюджет: `{fmt(s['budget'])}`\n"
-            f"Игроки сервера: `{fmt(s['players'])}`\n"
+            f"🏦 **Центральный банк** (общий для всех серверов)\nРезерв: `{fmt(s['reserve'])}`\n"
+            f"Фонды: `{fmt(s['funds'])}`\nГосбюджет: `{fmt(s['budget'])}`\n"
+            f"Игроки (все серверы): `{fmt(s['players'])}`\nВ обращении: `{fmt(s['circulation'])}`\n"
             f"Дефицит ЦБ: `{fmt(s['debt'])}`\nНапечатано: `{fmt(s['printed'])}`"
         )
 
-    @commands.hybrid_command(name="economy", description="Статистика экономики")
+    @commands.hybrid_command(name="economy", description="Статистика экономики этого сервера")
     async def economy(self, ctx):
-        s = await self.bot.stats(guild_id=ctx.guild.id if ctx.guild else None)
+        s = await self.bot.stats(ctx.guild.id)
         await safe_send(
             ctx,
-            f"📈 **Экономика**\nРезерв `{fmt(s['reserve'])}` | Фонды `{fmt(s['funds'])}`\n"
-            f"Госбюджет `{fmt(s['budget'])}`\nИгроки `{fmt(s['players'])}`\n"
+            f"📈 **Экономика сервера**\nИгроки `{fmt(s['players'])}` | "
             f"Долги игроков `{fmt(s['player_debt'])}`\n"
-            f"За 24ч: приход `{fmt(s['incoming'])}` / расход `{fmt(s['outgoing'])}`"
+            f"За 24ч: приход `{fmt(s['incoming'])}` / расход `{fmt(s['outgoing'])}`\n"
+            f"🏦 Общий ЦБ: резерв `{fmt(s['reserve'])}` | госбюджет `{fmt(s['budget'])}` | "
+            f"фонды `{fmt(s['funds'])}`"
         )
 
-    @commands.hybrid_command(name="print_money", description="Эмиссия (админ)")
+    @commands.hybrid_command(name="print_money", description="Эмиссия средств в общий резерв ЦБ")
     @commands.has_permissions(administrator=True)
     async def print_money(self, ctx, amount: int):
         if amount <= 0:
-            return await safe_send(ctx, "❌ Сумма положительная.")
+            return await safe_send(ctx, "❌ Сумма должна быть положительной.")
         async with await self.bot.mongo.start_session() as session:
             async with session.start_transaction():
                 await self.bot.change_reserve(amount, session=session)
                 await self.bot.economy.update_one(
                     {"_id": "central_bank"}, {"$inc": {"printed": amount}}, session=session
                 )
-                await self.bot.journal(
-                    "money_printing", "central_bank", amount, "Эмиссия", session=session
-                )
+                await self.bot.journal("money_printing", "central_bank", amount, "Эмиссия", session=session)
         await safe_send(ctx, f"✅ Эмиссия: `{fmt(amount)}`. Резерв: `{fmt(await self.bot.reserve())}`")
 
-    @commands.hybrid_command(name="burn_money", description="Сжечь из резерва (админ)")
+    @commands.hybrid_command(name="burn_money", description="Сжечь средства из общего резерва ЦБ")
     @commands.has_permissions(administrator=True)
     async def burn_money(self, ctx, amount: int):
         if amount <= 0:
-            return await safe_send(ctx, "❌ Сумма положительная.")
+            return await safe_send(ctx, "❌ Сумма должна быть положительной.")
         try:
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
                     if not await self.bot.change_reserve(-amount, session=session):
-                        raise EconomyError("Недостаточно в резерве.")
-                    await self.bot.journal(
-                        "central_bank", "money_burn", amount, "Сжигание", session=session
-                    )
+                        raise EconomyError("В резерве недостаточно средств.")
+                    await self.bot.journal("central_bank", "money_burn", amount,
+                                           "Сжигание денег", session=session)
         except EconomyError as e:
             return await safe_send(ctx, f"❌ {e}")
         await safe_send(ctx, f"🔥 Сожжено `{fmt(amount)}`.")
 
-    @commands.hybrid_command(name="setreportchannel", description="Канал отчётов (админ)")
+    @commands.hybrid_command(name="setreportchannel", description="Настроить канал ежедневных отчётов")
     @commands.has_permissions(administrator=True)
+    @app_commands.describe(channel="Канал для ежедневной сводки (по умолчанию текущий)")
     async def setreportchannel(self, ctx, channel: discord.TextChannel = None):
-        if ctx.guild is None:
-            return await safe_send(ctx, "❌ Только на сервере.")
         channel = channel or ctx.channel
-        settings = await self._settings(ctx)
         await self.bot.settings.update_one(
             {"_id": ctx.guild.id},
             {"$set": {"report_channel_id": channel.id, "updated_at": now()}},
             upsert=True,
         )
-        await safe_send(ctx, f"✅ Отчёты в {channel.mention} в {settings.report_hour:02d}:00 UTC.")
+        await safe_send(ctx, f"✅ Ежедневные отчёты будут отправляться в {channel.mention} примерно в {REPORT_HOUR_UTC:02d}:00 UTC.")
 
-    @commands.hybrid_command(name="setchartchannel", description="Канал графиков (админ)")
+    @commands.hybrid_command(name="setchartchannel", description="Настроить канал автоматических графиков")
     @commands.has_permissions(administrator=True)
+    @app_commands.describe(channel="Канал для ежедневных графиков (по умолчанию текущий)")
     async def setchartchannel(self, ctx, channel: discord.TextChannel = None):
-        if ctx.guild is None:
-            return await safe_send(ctx, "❌ Только на сервере.")
         channel = channel or ctx.channel
         await self.bot.settings.update_one(
             {"_id": ctx.guild.id},
             {"$set": {"chart_channel_id": channel.id, "updated_at": now()}},
             upsert=True,
         )
-        await safe_send(ctx, f"✅ Графики в {channel.mention} после отчёта.")
+        await safe_send(ctx, f"✅ Ежедневные графики будут отправляться в {channel.mention} после отчёта.")
 
-    @commands.hybrid_command(name="graphs", aliases=["chart"], description="Графики (админ)")
+    @commands.hybrid_command(name="graphs", aliases=["chart"], description="Сформировать графики экономики")
     @commands.has_permissions(administrator=True)
     async def graphs(self, ctx):
         await ctx.defer()
         await self.bot.snapshot()
         delivered = await self.bot.publish_charts(channel=ctx.channel)
         if delivered:
-            return await safe_send(ctx, "✅ Графики отправлены.")
-        await safe_send(ctx, "⚠️ Не удалось отправить. Проверь права «Прикреплять файлы».")
+            return await safe_send(ctx, "✅ Графики отправлены в этот канал.")
+        await safe_send(ctx, "⚠️ Не удалось отправить графики. Проверь у бота права "
+                             "«Отправлять сообщения» и «Прикреплять файлы» в этом канале.")
 
 
 # =============================================================================
-# CasinoCog — обновлённый под мультисерверность
+# Казино
 # =============================================================================
 def draw_card():
     return rng.randint(2, 11)
 
 
 def hand_value(cards):
+    """Сумма очков. Карта 11 — «туз»: если перебор, она считается за 1."""
     total = sum(cards)
     aces = cards.count(11)
     while total > 21 and aces:
@@ -1821,12 +1773,13 @@ def fmt_cards(cards, hide_second=False):
 
 
 PAYTABLES = {
-    "slot": "🎰 **Слоты**\nТройка на линии — **x2/x4/x10** за 1/2/3+ линии.",
-    "rr": "🔫 **Русская рулетка**\nШанс 1/6 — выплата **x5**.",
+    "slot": "🎰 **Выплаты слотов 3x3**\nСовпавшие символы на линии (ряд, столбец или диагональ):\n1 линия — **x2**, 2 линии — **x4**, 3 и больше — **x10**\nИначе — 0",
+    "rr": "🔫 **Русская рулетка**\nШанс выигрыша 1 из 6 — выплата **x5**.",
 }
 
 
 async def reply_ephemeral(interaction: discord.Interaction, text: str):
+    """Ответ, видимый только игроку. Безопасен, даже если на interaction уже ответили."""
     try:
         if interaction.response.is_done():
             await interaction.followup.send(text, ephemeral=True)
@@ -1853,11 +1806,14 @@ class PayoutsButton(discord.ui.Button):
 
 
 class CasinoView(discord.ui.View):
+    """Общая база для всех игр: владелец партии, блокировка, «Играть снова»."""
+
     def __init__(self, cog, guild_id: int, user_id: int, bet: int, *, timeout: float):
         super().__init__(timeout=timeout)
         self.cog = cog
         self.guild_id = guild_id
         self.user_id = user_id
+        self.key = (guild_id, user_id)  # ключ активной партии блэкджека
         self.bet = bet
         self.lock = asyncio.Lock()
         self.message = None
@@ -1877,6 +1833,7 @@ class CasinoView(discord.ui.View):
         return True
 
     async def _show(self, interaction, embed=None):
+        """Обновляет текущее сообщение (а не шлёт новое)."""
         kwargs = {"view": self}
         if embed is not None:
             kwargs["embed"] = embed
@@ -1886,15 +1843,17 @@ class CasinoView(discord.ui.View):
             elif self.message is not None:
                 await self.message.edit(**kwargs)
         except (discord.Forbidden, discord.NotFound):
-            log.warning("Не удалось обновить сообщение игры")
+            log.warning("Не удалось обновить сообщение игры (нет прав или оно удалено)")
         except discord.HTTPException:
-            log.exception("Ошибка обновления сообщения")
+            log.exception("Ошибка обновления сообщения игры")
 
     async def on_play_again(self, interaction: discord.Interaction):
         raise NotImplementedError
 
 
 class InstantGameView(CasinoView):
+    """Слоты и рулетка: результат известен сразу, под ним — «Играть снова» и «Выплаты»."""
+
     def __init__(self, cog, guild_id: int, user_id: int, bet: int, game: str):
         super().__init__(cog, guild_id, user_id, bet, timeout=PLAY_AGAIN_TIMEOUT)
         self.game = game
@@ -1911,15 +1870,12 @@ class InstantGameView(CasinoView):
                     child.disabled = True
                 if self.message is not None:
                     await self.message.edit(view=self)
-
                 async def progress(embed):
                     if self.message is not None:
                         await self.message.edit(embed=embed, view=self)
-
                 try:
                     embed = await self.cog.run_game(
-                        self.guild_id, self.game, self.user_id, self.bet,
-                        progress_callback=progress
+                        self.game, self.guild_id, self.user_id, self.bet, progress_callback=progress
                     )
                 except EconomyError as e:
                     for child in self.children:
@@ -1932,7 +1888,7 @@ class InstantGameView(CasinoView):
                 await self._show(None, embed)
                 return
             try:
-                embed = await self.cog.run_game(self.guild_id, self.game, self.user_id, self.bet)
+                embed = await self.cog.run_game(self.game, self.guild_id, self.user_id, self.bet)
             except EconomyError as e:
                 return await reply_ephemeral(interaction, f"❌ {e}")
             await self._show(interaction, embed)
@@ -1956,8 +1912,7 @@ class BlackjackView(CasinoView):
             color=color or discord.Color.gold(),
         )
         embed.add_field(name="Твои карты", value=fmt_cards(self.player), inline=False)
-        embed.add_field(name="Дилер", value=fmt_cards(self.dealer, hide_second=result is None),
-                        inline=False)
+        embed.add_field(name="Дилер", value=fmt_cards(self.dealer, hide_second=result is None), inline=False)
         if result:
             embed.add_field(name="Итог", value=result, inline=False)
         return embed
@@ -1968,6 +1923,7 @@ class BlackjackView(CasinoView):
                 child.disabled = disabled
 
     def new_round(self):
+        """Сбрасывает состояние: новые карты, кнопки «Взять/Хватит» снова активны."""
         self.player = [draw_card(), draw_card()]
         self.dealer = [draw_card(), draw_card()]
         self.done = False
@@ -1975,6 +1931,7 @@ class BlackjackView(CasinoView):
         self.remove_item(self.again_btn)
 
     async def _finish(self, interaction, outcome, *, offer_again=True):
+        """Завершает партию и рассчитывает выплату. Вызывать с захваченным self.lock."""
         self.done = True
         if outcome == "bust":
             payout, text, color = 0, "💥 Перебор! Ставка проиграна.", discord.Color.red()
@@ -1985,21 +1942,20 @@ class BlackjackView(CasinoView):
                 self.dealer.append(draw_card())
             p, d = hand_value(self.player), hand_value(self.dealer)
             if d > 21 or p > d:
-                payout, text, color = self.bet * 2, "✅ Победа! x2.", discord.Color.green()
+                payout, text, color = self.bet * 2, "✅ Ты победил! Выплата x2.", discord.Color.green()
             elif p == d:
-                payout, text, color = self.bet, "🤝 Ничья.", discord.Color.light_grey()
+                payout, text, color = self.bet, "🤝 Ничья — ставка возвращена.", discord.Color.light_grey()
             else:
-                payout, text, color = 0, "❌ Дилер победил.", discord.Color.red()
+                payout, text, color = 0, "❌ Дилер победил. Ставка проиграна.", discord.Color.red()
         if payout > 0:
             try:
                 await self.cog.settle_payout(self.guild_id, self.user_id, payout, "blackjack")
                 text += f"\nВыплата: **{fmt(payout)}**."
             except Exception:
-                log.exception("Ошибка выплаты bj gid=%s uid=%s", self.guild_id, self.user_id)
-                text += "\n⚠️ Ошибка выплаты."
-        await self.cog.bot.casino_active.delete_one(
-            {"guild_id": self.guild_id, "user_id": self.user_id}
-        )
+                log.exception("Не удалось выплатить выигрыш blackjack guild=%s uid=%s payout=%s",
+                              self.guild_id, self.user_id, payout)
+                text += "\n⚠️ Ошибка выплаты — обратись к администратору."
+        self.cog.active_bj.discard(self.key)
         self._lock_game_buttons(True)
         if offer_again:
             if self.again_btn not in self.children:
@@ -2034,25 +1990,21 @@ class BlackjackView(CasinoView):
                 return await interaction.response.defer()
             if not await self.has_funds(interaction):
                 return
-            if await self.cog.bot.casino_active.find_one(
-                {"guild_id": self.guild_id, "user_id": self.user_id}
-            ):
-                return await reply_ephemeral(interaction, "❌ Уже идёт другая партия.")
+            if self.key in self.cog.active_bj:
+                return await reply_ephemeral(interaction, "❌ У тебя уже идёт другая партия в блэкджек.")
+            self.cog.active_bj.add(self.key)
             try:
                 await self.cog.precheck(self.guild_id, self.user_id, self.bet)
                 async with await self.cog.bot.mongo.start_session() as session:
                     async with session.start_transaction():
-                        await self.cog.take_bet(
-                            self.guild_id, self.user_id, self.bet, "blackjack",
-                            max_payout=self.bet * 2, session=session
-                        )
+                        await self.cog.take_bet(self.guild_id, self.user_id, self.bet, "blackjack",
+                                                max_payout=self.bet * 2, session=session)
             except EconomyError as e:
+                self.cog.active_bj.discard(self.key)
                 return await reply_ephemeral(interaction, f"❌ {e}")
-            await self.cog.bot.casino_active.update_one(
-                {"guild_id": self.guild_id, "user_id": self.user_id},
-                {"$set": {"created_at": now()}},
-                upsert=True,
-            )
+            except Exception:
+                self.cog.active_bj.discard(self.key)
+                raise
             self.new_round()
             if hand_value(self.player) == 21:
                 await self._finish(interaction, "twentyone")
@@ -2062,6 +2014,7 @@ class BlackjackView(CasinoView):
     async def on_timeout(self):
         async with self.lock:
             if not self.done:
+                # Игрок не ответил: авто-«Хватит», без кнопки «Играть снова» (view уже остановлен).
                 await self._finish(None, "stand", offer_again=False)
             else:
                 self.again_btn.disabled = True
@@ -2069,10 +2022,14 @@ class BlackjackView(CasinoView):
 
 
 class CasinoCog(commands.Cog):
+    """Все ставки идут в резерв ЦБ, все выигрыши выплачиваются из резерва ЦБ."""
+
     def __init__(self, bot: EconomyBot):
         self.bot = bot
+        self.active_bj = set()  # (guild_id, user_id) с незавершённой партией (эфемерное состояние)
 
     async def _resolve_bet(self, ctx, raw):
+        """Ставка числом или 'all' (все наличные, но не больше CASINO_MAX_BET). None — ввод неверный."""
         user = await self.bot.ensure_user(ctx.guild.id, ctx.author.id)
         cash = int(user.get("cash", 0))
         bet = parse_amount(raw, min(cash, CASINO_MAX_BET))
@@ -2080,18 +2037,19 @@ class CasinoCog(commands.Cog):
             await safe_send(ctx, "❌ Укажи ставку числом или `all`.")
         return bet
 
-    async def precheck(self, guild_id: int, uid: int, bet: int):
+    async def precheck(self, gid: int, uid: int, bet: int):
         if bet < CASINO_MIN_BET or bet > CASINO_MAX_BET:
-            raise EconomyError(f"Ставка от {fmt(CASINO_MIN_BET)} до {fmt(CASINO_MAX_BET)}.")
-        user = await self.bot.ensure_user(guild_id, uid)
+            raise EconomyError(f"Ставка должна быть от {fmt(CASINO_MIN_BET)} до {fmt(CASINO_MAX_BET)}.")
+        user = await self.bot.ensure_user(gid, uid)
         cash = int(user.get("cash", 0))
         if cash < bet:
             raise EconomyError(f"Недостаточно наличных: у тебя `{fmt(cash)}`, ставка `{fmt(bet)}`.")
 
-    async def take_bet(self, guild_id: int, uid: int, bet: int, game: str, *,
-                       max_payout: int, session):
+    async def take_bet(self, gid: int, uid: int, bet: int, game: str, *, max_payout: int, session):
+        """Списывает ставку с cash в резерв ЦБ. Отказывает, если резерв (вместе со ставкой)
+        не покроет максимально возможную выплату."""
         debit = await self.bot.db_users.update_one(
-            {"guild_id": guild_id, "user_id": uid, "cash": {"$gte": bet}},
+            {**ukey(gid, uid), "cash": {"$gte": bet}},
             {"$inc": {"cash": -bet}, "$set": {"updated_at": now()}},
             session=session,
         )
@@ -2099,45 +2057,41 @@ class CasinoCog(commands.Cog):
             raise EconomyError("Недостаточно наличных.")
         await self.bot.change_reserve(bet, session=session)
         if await self.bot.reserve(session=session) < max_payout:
-            raise EconomyError("Резерв ЦБ слишком мал для такой ставки. Уменьши ставку.")
+            raise EconomyError("Резерв ЦБ слишком мал, чтобы покрыть возможный выигрыш. "
+                               "Уменьши ставку или попроси админа сделать эмиссию.")
         key = game.replace("_refund", "")
         await self.bot.casino_stats.update_one(
-            {"guild_id": guild_id, "user_id": uid},
+            ukey(gid, uid),
             {"$inc": {"games": 1, "wagered": bet,
                       f"by_game.{key}.games": 1, f"by_game.{key}.wagered": bet},
              "$set": {"updated_at": now()}},
             upsert=True, session=session,
         )
-        await self.bot.journal(
-            f"user_{guild_id}_{uid}", "central_bank", bet, f"Казино: ставка ({game})",
-            {"game": game, "guild_id": guild_id}, session=session
-        )
+        await self.bot.journal(f"user_{uid}", "central_bank", bet, f"Казино: ставка ({game})",
+                               {"game": game}, session=session, guild_id=gid)
 
-    async def pay_out(self, guild_id: int, uid: int, payout: int, game: str, *,
-                      session, force=False):
+    async def pay_out(self, gid: int, uid: int, payout: int, game: str, *, session, force=False):
+        """Выплата из резерва ЦБ. force=True — для уже принятых ставок (резерв может уйти в дефицит)."""
         if payout <= 0:
             return
         if not await self.bot.change_reserve(-payout, session=session, allow_negative=force):
             raise EconomyError("Резерв ЦБ не может покрыть выигрыш.")
-        await self.bot.change_cash(guild_id, uid, payout, session=session)
+        await self.bot.change_cash(gid, uid, payout, session=session)
         key = game.replace("_refund", "")
         await self.bot.casino_stats.update_one(
-            {"guild_id": guild_id, "user_id": uid},
-            {"$inc": {"paid": payout, f"by_game.{key}.paid": payout},
-             "$set": {"updated_at": now()}},
+            ukey(gid, uid),
+            {"$inc": {"paid": payout, f"by_game.{key}.paid": payout}, "$set": {"updated_at": now()}},
             upsert=True, session=session,
         )
-        await self.bot.journal(
-            "central_bank", f"user_{guild_id}_{uid}", payout,
-            f"Казино: выплата ({game})", {"game": game, "guild_id": guild_id},
-            session=session
-        )
+        await self.bot.journal("central_bank", f"user_{uid}", payout, f"Казино: выплата ({game})",
+                               {"game": game}, session=session, guild_id=gid)
 
-    async def settle_payout(self, guild_id: int, uid: int, payout: int, game: str):
+    async def settle_payout(self, gid: int, uid: int, payout: int, game: str):
         async with await self.bot.mongo.start_session() as session:
             async with session.start_transaction():
-                await self.pay_out(guild_id, uid, payout, game, session=session, force=True)
+                await self.pay_out(gid, uid, payout, game, session=session, force=True)
 
+    # --- Слоты и рулетка (общий движок + «Играть снова») ---------------------
     def _result_embed(self, title, body, bet, payout, cash, color):
         embed = discord.Embed(
             title=title,
@@ -2153,6 +2107,7 @@ class CasinoCog(commands.Cog):
 
     @staticmethod
     def _slot_winning_lines(grid):
+        # 3 ряда, 3 столбца и 2 диагонали — всего 8 линий.
         lines = [
             grid[0], grid[1], grid[2],
             [grid[0][0], grid[1][0], grid[2][0]],
@@ -2163,14 +2118,18 @@ class CasinoCog(commands.Cog):
         ]
         return [line for line in lines if line[0] == line[1] == line[2]]
 
-    async def run_slot(self, guild_id: int, uid: int, bet: int, progress_callback=None):
-        await self.precheck(guild_id, uid, bet)
+    async def run_slot(self, gid: int, uid: int, bet: int, progress_callback=None):
+        """3x3-слоты. Совпавшие тройки на линиях: x2 / x4 / x10 за 1 / 2 / 3+ линий.
+        Ставка и выплата проводятся одной MongoDB-транзакцией."""
+        await self.precheck(gid, uid, bet)
         final_grid = [[rng.choice(SLOT_SYMBOLS) for _ in range(3)] for _ in range(3)]
 
+        # Короткая анимация: несколько обновлений одного сообщения.
         if progress_callback is not None:
             for frame in range(3):
                 animated_grid = [
-                    [rng.choice(SLOT_SYMBOLS) for _ in range(3)] for _ in range(3)
+                    [rng.choice(SLOT_SYMBOLS) for _ in range(3)]
+                    for _ in range(3)
                 ]
                 anim_embed = discord.Embed(
                     title="🎰 Слоты крутятся…",
@@ -2181,7 +2140,7 @@ class CasinoCog(commands.Cog):
                 try:
                     await progress_callback(anim_embed)
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    log.warning("Не удалось показать кадр анимации")
+                    log.warning("Не удалось показать кадр анимации слотов")
                     progress_callback = None
                     break
                 await asyncio.sleep(1)
@@ -2193,51 +2152,51 @@ class CasinoCog(commands.Cog):
 
         async with await self.bot.mongo.start_session() as session:
             async with session.start_transaction():
-                await self.take_bet(guild_id, uid, bet, "slot",
-                                    max_payout=bet * 10, session=session)
-                await self.pay_out(guild_id, uid, payout, "slot", session=session)
+                await self.take_bet(gid, uid, bet, "slot", max_payout=bet * 10, session=session)
+                await self.pay_out(gid, uid, payout, "slot", session=session)
 
-        cash = int((await self.bot.get_balance(guild_id, uid)).get("cash", 0))
+        cash = int((await self.bot.get_balance(gid, uid)).get("cash", 0))
         title = (
             f"🎉 Джекпот! x{multiplier}" if line_count >= 3 else
             f"✨ Выигрыш x{multiplier}" if line_count else
-            "🎰 Не повезло"
+            "🎰 Не повезло в этот раз"
         )
         color = discord.Color.gold() if line_count >= 3 else (
             discord.Color.green() if line_count else discord.Color.red()
         )
         body = f"```\n{self._slot_grid_text(final_grid)}\n```"
-        body += (f"\nСовпавших линий: **{line_count}** из 8."
-                 if line_count else "\nСовпадений нет.")
-        return self._result_embed(title, body, bet, payout, cash, color)
+        if line_count:
+            body += f"\nСовпавших линий: **{line_count}** из 8."
+        else:
+            body += "\nСовпавших линий нет."
+        embed = self._result_embed(title, body, bet, payout, cash, color)
+        embed.set_footer(text=f"Ставка: {fmt(bet)} • Наличные: {fmt(cash)}")
+        return embed
 
-    async def run_rr(self, guild_id: int, uid: int, bet: int):
-        await self.precheck(guild_id, uid, bet)
+    async def run_rr(self, gid: int, uid: int, bet: int):
+        await self.precheck(gid, uid, bet)
         won = rng.randint(1, 6) == 1
         payout = bet * 5 if won else 0
         async with await self.bot.mongo.start_session() as session:
             async with session.start_transaction():
-                await self.take_bet(guild_id, uid, bet, "russian_roulette",
-                                    max_payout=bet * 5, session=session)
-                await self.pay_out(guild_id, uid, payout, "russian_roulette", session=session)
-        cash = int((await self.bot.get_balance(guild_id, uid)).get("cash", 0))
+                await self.take_bet(gid, uid, bet, "russian_roulette", max_payout=bet * 5, session=session)
+                await self.pay_out(gid, uid, payout, "russian_roulette", session=session)
+        cash = int((await self.bot.get_balance(gid, uid)).get("cash", 0))
         if won:
-            return self._result_embed("🔫 Повезло! x5", "*щёлк…* Пустая камера.",
+            return self._result_embed("🔫 Тебе повезло! x5", "*щёлк…* Пустая камера.",
                                       bet, payout, cash, discord.Color.green())
-        return self._result_embed("💥 БАХ!", "Ты потерял ставку.",
-                                  bet, payout, cash, discord.Color.red())
+        return self._result_embed("💥 БАХ!", "Ты потерял ставку.", bet, payout, cash, discord.Color.red())
 
-    async def run_game(self, guild_id: int, game: str, uid: int, bet: int,
-                       progress_callback=None):
+    async def run_game(self, game: str, gid: int, uid: int, bet: int, progress_callback=None):
+        """Одна партия мгновенной игры: списывает ставку, платит выигрыш, возвращает эмбед."""
         if game == "slot":
-            return await self.run_slot(guild_id, uid, bet, progress_callback=progress_callback)
+            return await self.run_slot(gid, uid, bet, progress_callback=progress_callback)
         if game == "rr":
-            return await self.run_rr(guild_id, uid, bet)
+            return await self.run_rr(gid, uid, bet)
         raise ValueError(game)
 
     async def _start_instant(self, ctx, game: str, bet: int):
-        gid = ctx.guild.id
-        uid = ctx.author.id
+        gid, uid = ctx.guild.id, ctx.author.id
         view = InstantGameView(self, gid, uid, bet, game)
         if game == "slot":
             for child in view.children:
@@ -2250,12 +2209,10 @@ class CasinoCog(commands.Cog):
             view.message = await safe_send(ctx, embed=placeholder, view=view)
             if view.message is None:
                 return
-
             async def progress(embed):
                 await view.message.edit(embed=embed, view=view)
-
             try:
-                embed = await self.run_game(gid, game, uid, bet, progress_callback=progress)
+                embed = await self.run_game(game, gid, uid, bet, progress_callback=progress)
             except EconomyError as e:
                 await view.message.edit(content=f"❌ {e}", embed=None, view=None)
                 return
@@ -2264,24 +2221,21 @@ class CasinoCog(commands.Cog):
             await view.message.edit(embed=embed, view=view)
             return
         try:
-            embed = await self.run_game(gid, game, uid, bet)
+            embed = await self.run_game(game, gid, uid, bet)
         except EconomyError as e:
             return await safe_send(ctx, f"❌ {e}")
         view.message = await safe_send(ctx, embed=embed, view=view)
 
     GAME_LABELS = {"slot": "🎰 Слоты", "russian_roulette": "🔫 Рулетка", "blackjack": "🃏 Блэкджек"}
 
-    @commands.hybrid_command(name="casinostats", aliases=["cstats"],
-                             description="Статистика казино игрока (на этом сервере)")
+    @commands.hybrid_command(name="casinostats", aliases=["cstats"], description="Статистика казино игрока")
+    @app_commands.describe(member="Чью статистику показать")
     async def casinostats(self, ctx, member: discord.Member = None):
         member = member or ctx.author
-        doc = await self.bot.casino_stats.find_one(
-            {"guild_id": ctx.guild.id, "user_id": member.id}
-        )
+        doc = await self.bot.casino_stats.find_one(ukey(ctx.guild.id, member.id))
         if not doc or not int(doc.get("games", 0)):
-            return await safe_send(ctx, f"🎲 {member.display_name} ещё не играл.")
-        wagered, paid, games = (int(doc.get("wagered", 0)), int(doc.get("paid", 0)),
-                                int(doc.get("games", 0)))
+            return await safe_send(ctx, f"🎲 {member.display_name} ещё не играл в казино.")
+        wagered, paid, games = int(doc.get("wagered", 0)), int(doc.get("paid", 0)), int(doc.get("games", 0))
         net = paid - wagered
         rtp = paid / wagered * 100 if wagered else 0
         embed = discord.Embed(
@@ -2291,11 +2245,7 @@ class CasinoCog(commands.Cog):
         embed.add_field(name="Игр", value=f"`{fmt(games)}`", inline=True)
         embed.add_field(name="Поставлено", value=f"`{fmt(wagered)}`", inline=True)
         embed.add_field(name="Выплачено", value=f"`{fmt(paid)}`", inline=True)
-        embed.add_field(
-            name="Итог",
-            value=f"`{'+' if net >= 0 else '-'}{fmt(abs(net))}` ({rtp:.0f}% возврата)",
-            inline=False,
-        )
+        embed.add_field(name="Итог", value=f"`{'+' if net >= 0 else '-'}{fmt(abs(net))}` ({rtp:.0f}% возврата)", inline=False)
         lines = []
         for key, row in (doc.get("by_game") or {}).items():
             g_net = int(row.get("paid", 0)) - int(row.get("wagered", 0))
@@ -2306,50 +2256,55 @@ class CasinoCog(commands.Cog):
         embed.set_thumbnail(url=member.display_avatar.url)
         await safe_send(ctx, embed=embed)
 
-    @commands.hybrid_command(name="slot", description="Слоты 3x3")
+    @commands.hybrid_command(name="slot", description="Слоты 3x3: выигрышные линии x2, x4 или x10")
+    @app_commands.describe(bet="Ставка наличными или all")
     async def slot(self, ctx, bet: str):
         bet = await self._resolve_bet(ctx, bet)
         if bet is None:
             return
         await self._start_instant(ctx, "slot", bet)
 
-    @commands.hybrid_command(name="rr", description="Русская рулетка")
+    @commands.hybrid_command(name="rr", description="Русская рулетка: шанс 1 к 6, выигрыш x5")
+    @app_commands.describe(bet="Ставка наличными или all")
     async def rr(self, ctx, bet: str):
         bet = await self._resolve_bet(ctx, bet)
         if bet is None:
             return
         await self._start_instant(ctx, "rr", bet)
 
-    @commands.hybrid_command(name="bj", description="Блэкджек")
+    # --- Блэкджек ------------------------------------------------------------
+    @commands.hybrid_command(name="bj", description="Блэкджек: набери 21, дилер берёт до 17")
+    @app_commands.describe(bet="Ставка наличными или all")
     async def bj(self, ctx, bet: str):
-        gid = ctx.guild.id
-        uid = ctx.author.id
-        if await self.bot.casino_active.find_one({"guild_id": gid, "user_id": uid}):
-            return await safe_send(ctx, "❌ У тебя уже идёт партия.")
+        gid, uid = ctx.guild.id, ctx.author.id
+        key = (gid, uid)
+        if key in self.active_bj:
+            return await safe_send(ctx, "❌ У тебя уже идёт партия в блэкджек.")
         bet = await self._resolve_bet(ctx, bet)
         if bet is None:
             return
+        self.active_bj.add(key)
         try:
             await self.precheck(gid, uid, bet)
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
-                    await self.take_bet(gid, uid, bet, "blackjack",
-                                        max_payout=bet * 2, session=session)
+                    await self.take_bet(gid, uid, bet, "blackjack", max_payout=bet * 2, session=session)
         except EconomyError as e:
+            self.active_bj.discard(key)
             return await safe_send(ctx, f"❌ {e}")
-        await self.bot.casino_active.update_one(
-            {"guild_id": gid, "user_id": uid},
-            {"$set": {"created_at": now()}},
-            upsert=True,
-        )
+        except Exception:
+            self.active_bj.discard(key)
+            raise
+
         view = BlackjackView(self, gid, uid, bet)
         message = await safe_send(ctx, embed=view.render(), view=view)
         if message is None:
+            # Не смогли показать игру (нет прав/канал удалён) — возвращаем ставку.
             try:
                 await self.settle_payout(gid, uid, bet, "blackjack_refund")
             except Exception:
-                log.exception("Не удалось вернуть ставку bj gid=%s uid=%s", gid, uid)
-            await self.bot.casino_active.delete_one({"guild_id": gid, "user_id": uid})
+                log.exception("Не удалось вернуть ставку blackjack guild=%s uid=%s bet=%s", gid, uid, bet)
+            self.active_bj.discard(key)
             return
         view.message = message
         if hand_value(view.player) == 21:
@@ -2358,7 +2313,7 @@ class CasinoCog(commands.Cog):
 
 
 # =============================================================================
-# AICog
+# ИИ-команды
 # =============================================================================
 class AICog(commands.Cog):
     def __init__(self, bot: EconomyBot):
@@ -2368,7 +2323,7 @@ class AICog(commands.Cog):
         doc = await self.bot.settings.find_one({"_id": int(guild_id)}) or {}
         return bool(doc.get("ai_enabled", True))
 
-    @commands.hybrid_command(name="ai_toggle", description="Вкл/выкл ИИ-отчёты (админ)")
+    @commands.hybrid_command(name="ai_toggle", description="Включить/выключить ИИ-отчёты на этом сервере")
     @commands.has_permissions(administrator=True)
     @commands.guild_only()
     async def ai_toggle(self, ctx):
@@ -2380,26 +2335,225 @@ class AICog(commands.Cog):
         )
         note = ""
         if new_state and not self.bot.ai.enabled:
-            note = "\n⚠️ `GROQ_API_KEY` не задан, ИИ недоступен."
-        await safe_send(ctx, f"🤖 ИИ-отчёты: **{'вкл' if new_state else 'выкл'}**.{note}")
+            note = "\n⚠️ Но на стороне бота не задан `AI_API_KEY` или `GROQ_API_KEY`, поэтому ИИ фактически недоступен."
+        await safe_send(ctx, f"🤖 ИИ-отчёты на этом сервере: **{'включены' if new_state else 'выключены'}**.{note}")
 
-    @commands.hybrid_command(name="ai_report", description="ИИ-отчёт (админ)")
+    @commands.hybrid_command(name="ai_report", description="ИИ-отчёт о состоянии экономики")
     @commands.has_permissions(administrator=True)
     @commands.guild_only()
     async def ai_report(self, ctx):
         if not self.bot.ai.enabled:
-            return await safe_send(ctx, "🤖 ИИ отключён: нет `GROQ_API_KEY`.")
+            return await safe_send(ctx, "🤖 ИИ отключён: у бота не задан `GROQ_API_KEY`.")
         if not await self.guild_ai_enabled(ctx.guild.id):
-            return await safe_send(ctx, "🤖 ИИ-отчёты выключены. `!ai_toggle`.")
+            return await safe_send(ctx, "🤖 ИИ-отчёты выключены на этом сервере. Включить: `!ai_toggle`.")
         await ctx.defer()
-        stats = await self.bot.stats(guild_id=ctx.guild.id)
+        stats = await self.bot.stats(ctx.guild.id)
         try:
             text = await self.bot.ai.market_report(stats)
         except AIError as e:
-            return await safe_send(ctx, f"⚠️ Не удалось: {e}")
+            return await safe_send(ctx, f"⚠️ Не удалось получить ИИ-отчёт: {e}")
         if len(text) > 1900:
             text = text[:1900].rstrip() + "…"
-        await safe_send(ctx, f"🤖 **ИИ-отчёт**\n{text}")
+        await safe_send(ctx, f"🤖 **ИИ-отчёт по экономике**\n{text}")
+
+
+# =============================================================================
+# Панель настроек /settings
+# =============================================================================
+def preset_label(preset):
+    return PRESETS[preset]["label"] if preset in PRESETS else "⚙️ Кастомная"
+
+
+def settings_embed(guild, cfg):
+    colors = {"easy": discord.Color.green(), "standard": discord.Color.gold(),
+              "hardcore": discord.Color.red()}
+    embed = discord.Embed(
+        title=f"⚙️ Настройки экономики — {guild.name}",
+        description=(f"Текущий пресет: **{preset_label(cfg['preset'])}**\n"
+                     "Выбери пресет в меню ниже. «⚙️ Кастомная» откроет ручную настройку "
+                     "шансов, налогов, кулдаунов и зарплаты."),
+        color=colors.get(cfg["preset"], discord.Color.blurple()),
+    )
+    embed.add_field(
+        name="⏱️ Кулдауны",
+        value="\n".join(f"`!{k}` — {fmt_cooldown(cfg[f'cooldown_{k}'])}" for k in COOLDOWN_KEYS),
+        inline=True,
+    )
+    embed.add_field(
+        name="🎲 Шансы",
+        value=(f"`!crime`, `!slut`: {fmt_pct(cfg['crime_chance'])}\n"
+               f"`!rob`: {fmt_pct(cfg['rob_chance'])}"),
+        inline=True,
+    )
+    embed.add_field(
+        name="💰 Заработок и налоги",
+        value=(f"`!work`: {fmt(cfg['work_min'])}–{fmt(cfg['work_max'])}\n"
+               f"`!daily`: {fmt(cfg['daily_min'])}–{fmt(cfg['daily_max'])}\n"
+               f"НДФЛ: {fmt_pct(cfg['tax_rate'])} • налог на бизнес: {fmt_pct(cfg['business_tax'])}"),
+        inline=False,
+    )
+    embed.add_field(
+        name="🏦 Кредит",
+        value=(f"Процент: {fmt_pct(cfg['loan_interest'])} • "
+               f"штраф просрочки: {fmt_pct(cfg['loan_penalty'])} в сутки"),
+        inline=False,
+    )
+    embed.set_footer(text="Изменения применяются сразу. Резерв ЦБ и госбюджет — общие для всех серверов.")
+    return embed
+
+
+class PresetSelect(discord.ui.Select):
+    def __init__(self, current: str):
+        options = []
+        for key, preset in PRESETS.items():
+            emoji, name = preset["label"].split(" ", 1)
+            options.append(discord.SelectOption(
+                label=name, value=key, emoji=emoji,
+                description=preset["description"][:100], default=(key == current)))
+        options.append(discord.SelectOption(
+            label="Кастомная", value="custom", emoji="⚙️",
+            description="Ввести шансы, налоги и кулдауны вручную", default=(current == "custom")))
+        super().__init__(placeholder="Выбери пресет экономики", min_values=1, max_values=1,
+                         options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.apply_preset(interaction, self.values[0])
+
+
+class SectionSelect(discord.ui.Select):
+    """Второе меню (только в режиме «Кастомная»): какой раздел настроек открыть в форме."""
+
+    def __init__(self):
+        options = []
+        for key, section in SETTING_SECTIONS.items():
+            emoji, name = section["label"].split(" ", 1)
+            options.append(discord.SelectOption(label=name, value=key, emoji=emoji))
+        super().__init__(placeholder="Что настроить вручную?", min_values=1, max_values=1,
+                         options=options, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        cfg = await self.view.bot.get_settings(self.view.guild.id)
+        await interaction.response.send_modal(SettingsModal(self.view, self.values[0], cfg))
+
+
+class SettingsView(discord.ui.View):
+    def __init__(self, bot, author_id: int, guild: discord.Guild, cfg: dict):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.author_id = author_id
+        self.guild = guild
+        self.message = None
+        self.add_item(PresetSelect(cfg["preset"]))
+        if cfg["preset"] == "custom":
+            self.add_item(SectionSelect())
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if interaction.user.id != self.author_id or not (perms and perms.administrator):
+            await reply_ephemeral(interaction, "Эта панель доступна только администратору, открывшему её.")
+            return False
+        return True
+
+    async def refresh(self, interaction: discord.Interaction):
+        """Перерисовывает панель по актуальным настройкам (пересоздаём View под новый режим)."""
+        cfg = await self.bot.get_settings(self.guild.id)
+        new_view = SettingsView(self.bot, self.author_id, self.guild, cfg)
+        embed = settings_embed(self.guild, cfg)
+        try:
+            await interaction.response.edit_message(embed=embed, view=new_view)
+            new_view.message = interaction.message or self.message
+        except (discord.HTTPException, TypeError, ValueError):
+            new_view.message = self.message
+            if new_view.message is not None:
+                try:
+                    await new_view.message.edit(embed=embed, view=new_view)
+                except (discord.HTTPException, TypeError, ValueError):
+                    log.warning("Не удалось обновить панель настроек")
+            await reply_ephemeral(interaction, "✅ Сохранено.")
+        self.stop()
+
+    async def apply_preset(self, interaction: discord.Interaction, choice: str):
+        gid = self.guild.id
+        if choice == "custom":
+            # Значения остаются прежними — админ дальше правит их вручную.
+            update = {"$set": {"eco.preset": "custom", "updated_at": now()}}
+        else:
+            update = {
+                "$set": {"eco": {"preset": choice, **PRESETS[choice]["values"]}, "updated_at": now()},
+                "$unset": {f"cooldown_{key}": "" for key in COOLDOWN_KEYS},  # старый формат
+            }
+        await self.bot.settings.update_one({"_id": gid}, update, upsert=True)
+        self.bot.invalidate_settings(gid)
+        log.info("Guild %s: пресет экономики -> %s", gid, choice)
+        await self.refresh(interaction)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except (discord.HTTPException, TypeError, ValueError):
+                pass
+
+
+class SettingsModal(discord.ui.Modal):
+    """Форма ручной настройки одного раздела (в Discord — не больше 5 полей)."""
+
+    def __init__(self, panel: SettingsView, section: str, cfg: dict):
+        spec = SETTING_SECTIONS[section]
+        super().__init__(title=spec["title"][:45], timeout=300)
+        self.panel = panel
+        self.inputs = {}
+        for key in spec["keys"]:
+            _kind, _lo, _hi, label, hint = SETTING_SPECS[key]
+            item = discord.ui.TextInput(
+                label=label[:45], default=setting_input_default(key, cfg[key]),
+                placeholder=hint[:100], required=True, max_length=20)
+            self.add_item(item)
+            self.inputs[key] = item
+
+    async def on_submit(self, interaction: discord.Interaction):
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if not (perms and perms.administrator):
+            return await reply_ephemeral(interaction, "❌ Нужны права администратора.")
+        values, errors = {}, []
+        for key, item in self.inputs.items():
+            try:
+                values[key] = parse_setting(key, item.value)
+            except ValueError as e:
+                errors.append(f"• **{SETTING_SPECS[key][3]}**: {e}")
+        gid = self.panel.guild.id
+        merged = {**await self.panel.bot.get_settings(gid), **values}
+        if merged["work_min"] > merged["work_max"]:
+            errors.append("• **Зарплата !work**: минимум больше максимума")
+        if merged["daily_min"] > merged["daily_max"]:
+            errors.append("• **Бонус !daily**: минимум больше максимума")
+        if errors:
+            return await reply_ephemeral(interaction, "❌ Не сохранено:\n" + "\n".join(errors))
+        update = {"$set": {**{f"eco.{key}": value for key, value in values.items()},
+                           "eco.preset": "custom", "updated_at": now()}}
+        await self.panel.bot.settings.update_one({"_id": gid}, update, upsert=True)
+        self.panel.bot.invalidate_settings(gid)
+        log.info("Guild %s: ручные настройки экономики %s", gid, values)
+        await self.panel.refresh(interaction)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.error("Ошибка формы настроек", exc_info=error)
+        await reply_ephemeral(interaction, "⚠️ Внутренняя ошибка. Попробуй ещё раз.")
+
+
+class SettingsCog(commands.Cog):
+    def __init__(self, bot: EconomyBot):
+        self.bot = bot
+
+    @commands.hybrid_command(name="settings", description="Панель настроек экономики сервера (админ)")
+    @commands.has_permissions(administrator=True)
+    @commands.guild_only()
+    async def settings_panel(self, ctx):
+        cfg = await self.bot.get_settings(ctx.guild.id)
+        view = SettingsView(self.bot, ctx.author.id, ctx.guild, cfg)
+        view.message = await safe_send(ctx, embed=settings_embed(ctx.guild, cfg), view=view, ephemeral=True)
 
 
 def main():
