@@ -18,8 +18,10 @@ from pymongo.errors import DuplicateKeyError, OperationFailure
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.ticker import FuncFormatter
 
-BOT_VERSION = "7.0.0"
+BOT_VERSION = "7.1.0"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_USER = os.getenv("MONGO_USER")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
@@ -495,7 +497,6 @@ class EconomyBot(commands.Bot):
 
         await self.add_cog(EconomyCog(self))
         await self.add_cog(CasinoCog(self))
-        await self.add_cog(AICog(self))
         await self.add_cog(SettingsCog(self))
 
         if not self.ai.enabled:
@@ -773,6 +774,17 @@ class EconomyBot(commands.Bot):
         await self.journal("economy", f"user_{user_id}", net, reason,
                            {"gross": gross, "tax": tax, "tax_rate": tax_rate},
                            session=session, guild_id=guild_id)
+        # Заработок создаётся «из воздуха» (net игроку + налог в бюджет = gross),
+        # поэтому учитываем его как эмиссию, чтобы денежная масса в !cb сходилась.
+        if gross > 0:
+            await self.economy.update_one(
+                {"_id": self.cb_id(guild_id)},
+                {"$inc": {"printed": gross}, "$set": {"updated_at": now()},
+                 "$setOnInsert": {"guild_id": int(guild_id), "reserve": 0, "created_at": now()}},
+                upsert=True, session=session)
+            await self.journal("money_printing", "economy", gross, f"Эмиссия: {reason}",
+                               {"type": "earning_emission", "tax": tax},
+                               session=session, guild_id=guild_id)
 
     async def pay_earning(self, guild_id, user_id, gross, reason, *, tax_rate,
                           account="cash", session=None):
@@ -838,19 +850,30 @@ class EconomyBot(commands.Bot):
                 log.exception("Snapshot failed for guild %s", guild.id)
 
     @staticmethod
-    def _render_chart(rows, title, path):
+    def _render_chart(rows, path):
+        """Тёмный график «в стиле Discord»: зелёная линия + полупрозрачная заливка."""
+        bg, fg, grid, green = "#2f3136", "#b9bbbe", "#ffffff", "#2ecc71"
         dates = [as_utc(r["created_at"]) for r in rows]
-        fig, ax = plt.subplots(figsize=(13, 6.5))
-        ax.plot(dates, [int(r.get("reserve", 0)) for r in rows], label="Резерв ЦБ", linewidth=2)
-        ax.plot(dates, [int(r.get("circulation", 0)) for r in rows], label="В обращении", linewidth=2)
-        ax.plot(dates, [int(r.get("debt", 0)) for r in rows], label="Дефицит ЦБ", linewidth=2)
-        ax.plot(dates, [int(r.get("state_budget", r.get("budget", 0))) for r in rows],
-                label="Госбюджет", linewidth=2)
-        ax.axhline(0, linewidth=1)
-        ax.set_title(title); ax.set_xlabel("Время"); ax.set_ylabel("Монеты")
-        ax.grid(True, alpha=0.25); ax.legend()
-        fig.autofmt_xdate(rotation=30); fig.tight_layout()
-        fig.savefig(path, dpi=120, bbox_inches="tight")
+        values = [int(r.get("circulation", 0)) for r in rows]
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        fig.patch.set_facecolor(bg)
+        ax.set_facecolor(bg)
+        lo, hi = min(values), max(values)
+        pad = (hi - lo) * 0.1 or max(1, abs(hi) * 0.05)
+        floor = lo - pad
+        ax.set_ylim(floor, hi + pad)
+        ax.plot(dates, values, color=green, linewidth=2,
+                marker="o" if len(values) <= 60 else None, markersize=3)
+        ax.fill_between(dates, values, floor, color=green, alpha=0.15)
+        ax.grid(True, color=grid, alpha=0.06)
+        for side in ("top", "right", "left", "bottom"):
+            ax.spines[side].set_visible(False)
+        ax.tick_params(colors=fg, length=0, labelsize=9)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8))
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: fmt(v)))
+        fig.tight_layout()
+        fig.savefig(path, dpi=120, facecolor=bg)
         plt.close(fig)
 
     async def publish_charts(self, guild_id, channel=None) -> bool:
@@ -858,26 +881,31 @@ class EconomyBot(commands.Bot):
             rows = await self.history.find({"guild_id": int(guild_id)}).sort("created_at", 1).to_list(100000)
             if not rows: return False
             clean = [r for r in rows if as_utc(r.get("created_at"))]
+            if not clean: return False
             day = [r for r in clean if as_utc(r["created_at"]) >= now() - timedelta(hours=24)] or clean[-1:]
             try:
-                await asyncio.to_thread(self._render_chart, clean[-2500:],
-                                        f"Экономика — вся история (guild {guild_id})",
-                                        self.chart_files["all"])
-                await asyncio.to_thread(self._render_chart, day[-1500:],
-                                        f"Экономика — 24 часа (guild {guild_id})",
-                                        self.chart_files["24h"])
+                await asyncio.to_thread(self._render_chart, clean[-2500:], self.chart_files["all"])
+                await asyncio.to_thread(self._render_chart, day[-1500:], self.chart_files["24h"])
             except Exception:
                 log.exception("Chart render failed")
                 return False
             if channel is None: return False
             try:
-                files = [discord.File(self.chart_files["all"], filename="economy_all.png"),
-                         discord.File(self.chart_files["24h"], filename="economy_24h.png")]
+                files = [discord.File(self.chart_files["24h"], filename="economy_chart.png"),
+                         discord.File(self.chart_files["all"], filename="economy_chart_all.png")]
             except OSError:
                 return False
-            message = await safe_send(channel,
-                f"📊 Графики экономики сервера обновлены: <t:{int(now().timestamp())}:R>",
-                files=files)
+            current = int(clean[-1].get("circulation", 0))
+            first_day = int(day[0].get("circulation", 0))
+            diff = current - first_day
+            e24 = make_embed("info", "Денежная масса — 24 часа",
+                description=(f"В обращении: `{fmt(current)}`\n"
+                             f"Изменение за период: `{'+' if diff >= 0 else '-'}{fmt(abs(diff))}`"),
+                footer=f"Сервер ID: {int(guild_id)}")
+            e24.set_image(url="attachment://economy_chart.png")
+            eall = make_embed("info", "Денежная масса — вся история")
+            eall.set_image(url="attachment://economy_chart_all.png")
+            message = await safe_send(channel, embeds=[e24, eall], files=files)
             return message is not None
 
     # ---------- Фоновые задачи ----------
@@ -890,6 +918,9 @@ class EconomyBot(commands.Bot):
             gid, uid = business.get("guild_id"), business.get("user_id")
             if gid is None or uid is None: continue
             gid, uid = int(gid), int(uid)
+            # Модуль выключен — бизнесы сервера не трогаем (данные сохраняются)
+            if not await self.module_enabled(gid, "business"):
+                continue
             level = max(1, int(business.get("level", 1)))
             try:
                 cfg = await self.get_settings(gid)
@@ -910,6 +941,15 @@ class EconomyBot(commands.Bot):
                         await self.add_budget(gid, tax,
                             f"Налог на имущество бизнеса {fmt_pct(cfg['business_tax'])}",
                             session=session)
+                        # Доход бизнеса создаётся из воздуха — учитываем как эмиссию
+                        await self.economy.update_one(
+                            {"_id": self.cb_id(gid)},
+                            {"$inc": {"printed": income}, "$set": {"updated_at": current},
+                             "$setOnInsert": {"guild_id": gid, "reserve": 0, "created_at": current}},
+                            upsert=True, session=session)
+                        await self.journal("money_printing", "economy", income,
+                                           "Эмиссия: доход бизнеса", {"type": "business_emission"},
+                                           session=session, guild_id=gid)
                         await self.businesses.update_one(
                             ukey(gid, uid),
                             {"$set": {"last_payout": current, "last_checked": current, "frozen": False}},
@@ -1060,7 +1100,7 @@ class EconomyCog(commands.Cog):
                          "Включить можно через `/settings`.")
         return False
 
-    @commands.hybrid_command(name="help", description="Команды экономики")
+    @commands.hybrid_command(name="help", aliases=["h"], description="Команды экономики")
     async def help_command(self, ctx):
         await send_embed(ctx, "info", "Справка по экономике",
             description="**Баланс у каждого сервера свой — своя инфляция, свой ЦБ.**",
@@ -1080,12 +1120,16 @@ class EconomyCog(commands.Cog):
                 ("🎰 Казино",
                  "`!slot ставка` `!bj ставка` `!rr ставка`\n`!casinostats [@user]`", False),
                 ("⚙️ Админ",
-                 "`/settings` — панель\n`/graphs` — графики\n`!ai_report` — ИИ-отчёт", False),
+                 "`/settings` — панель\n`!graphs` — графики\n🤖 ИИ — кнопки в `/settings`", False),
             ],
             thumbnail=ctx.guild.icon.url if ctx.guild.icon else None)
 
-    @commands.hybrid_command(name="balance", description="Показать баланс")
+    @commands.hybrid_command(name="balance", aliases=["bal", "b"], description="Показать баланс")
     async def balance(self, ctx, member: discord.Member = None):
+        async with ctx.typing():
+            await self._balance(ctx, member)
+
+    async def _balance(self, ctx, member: discord.Member = None):
         member = member or ctx.author
         data = await self.bot.get_balance(ctx.guild.id, member.id)
         await send_embed(ctx, "info", f"Баланс — {member.display_name}",
@@ -1097,7 +1141,7 @@ class EconomyCog(commands.Cog):
             thumbnail=member.display_avatar.url,
             footer=f"Сервер: {ctx.guild.name}")
 
-    @commands.hybrid_command(name="pay", description="Перевести наличные игроку")
+    @commands.hybrid_command(name="pay", aliases=["p"], description="Перевести наличные игроку")
     @app_commands.describe(member="Кому", amount="Сумма")
     async def pay(self, ctx, member: discord.Member, amount: int):
         if member.bot:
@@ -1106,8 +1150,12 @@ class EconomyCog(commands.Cog):
         await send_embed(ctx, "success" if ok else "danger",
                          "Перевод выполнен" if ok else "Перевод отклонён", message)
 
-    @commands.hybrid_command(name="work", description="Поработать")
+    @commands.hybrid_command(name="work", aliases=["w"], description="Поработать")
     async def work(self, ctx):
+        async with ctx.typing():
+            await self._work(ctx)
+
+    async def _work(self, ctx):
         gid, uid = ctx.guild.id, ctx.author.id
         await self.bot.ensure_user(gid, uid)
         cfg = await self.bot.get_settings(gid)
@@ -1149,6 +1197,8 @@ class EconomyCog(commands.Cog):
                     if not await self.bot.claim_cooldown(gid, uid, key, cooldown, session=session):
                         raise CooldownError("cooldown")
                     if success:
+                        # Добыча выплачивается из резерва ЦБ (reserve -> cash): масса не растёт,
+                        # printed не трогаем — иначе эмиссия была бы посчитана дважды.
                         if not await self.bot.change_reserve(gid, -reward, session=session):
                             raise EconomyError("В резерве ЦБ недостаточно средств. Попроси админа сделать эмиссию.")
                         await self.bot.change_cash(gid, uid, reward, session=session)
@@ -1190,14 +1240,22 @@ class EconomyCog(commands.Cog):
             await send_embed(ctx, "danger", cfg_action["title"],
                 description=rng.choice(cfg_action["lose"]) + "\n🚔 У тебя нечего отбирать — штраф 0.")
 
-    @commands.hybrid_command(name="crime", description="Кража")
-    async def crime(self, ctx): await self._criminal_action(ctx, "crime")
+    @commands.hybrid_command(name="crime", aliases=["c"], description="Кража")
+    async def crime(self, ctx):
+        async with ctx.typing():
+            await self._criminal_action(ctx, "crime")
 
-    @commands.hybrid_command(name="slut", description="Ночная подработка")
-    async def slut(self, ctx): await self._criminal_action(ctx, "slut")
+    @commands.hybrid_command(name="slut", aliases=["s"], description="Ночная подработка")
+    async def slut(self, ctx):
+        async with ctx.typing():
+            await self._criminal_action(ctx, "slut")
 
-    @commands.hybrid_command(name="daily", description="Ежедневный бонус")
+    @commands.hybrid_command(name="daily", aliases=["d"], description="Ежедневный бонус")
     async def daily(self, ctx):
+        async with ctx.typing():
+            await self._daily(ctx)
+
+    async def _daily(self, ctx):
         gid, uid = ctx.guild.id, ctx.author.id
         await self.bot.ensure_user(gid, uid)
         cfg = await self.bot.get_settings(gid)
@@ -1226,9 +1284,13 @@ class EconomyCog(commands.Cog):
             description=f"🎁 Получено **{fmt(reward)}** монет (без налога).",
             thumbnail=ctx.author.display_avatar.url)
 
-    @commands.hybrid_command(name="rob", description="Ограбить игрока")
+    @commands.hybrid_command(name="rob", aliases=["r"], description="Ограбить игрока")
     @app_commands.describe(member="Кого грабим")
     async def rob(self, ctx, member: discord.Member):
+        async with ctx.typing():
+            await self._rob(ctx, member)
+
+    async def _rob(self, ctx, member: discord.Member):
         if not await self._require_module(ctx, "crime", "Криминал"): return
         gid, uid, tid = ctx.guild.id, ctx.author.id, member.id
         if member.bot or tid == uid:
@@ -1292,7 +1354,7 @@ class EconomyCog(commands.Cog):
             await send_embed(ctx, "danger", "🚔 Тебя поймали",
                 description="С тебя нечего взять — штраф 0.")
 
-    @commands.hybrid_command(name="setcooldown", description="Кулдаун команды (админ)")
+    @commands.hybrid_command(name="set-cooldown", with_app_command=False, description="Кулдаун команды (админ)")
     @commands.has_permissions(administrator=True)
     @commands.guild_only()
     @app_commands.describe(command="work/crime/slut/daily/rob", seconds="Кулдаун в секундах")
@@ -1348,7 +1410,7 @@ class EconomyCog(commands.Cog):
     async def withdraw(self, ctx, amount: str):
         await self._move_money(ctx, amount, to_bank=False)
 
-    @commands.hybrid_command(name="top", description="Топ-10 игроков")
+    @commands.hybrid_command(name="top", aliases=["t"], description="Топ-10 игроков")
     async def top(self, ctx):
         rows = await self.bot.db_users.aggregate([
             {"$match": {"guild_id": ctx.guild.id}},
@@ -1389,7 +1451,7 @@ class EconomyCog(commands.Cog):
             fields.append(("⬆️ Улучшение", "Достигнут максимум", False))
         return fields
 
-    @commands.hybrid_group(name="business", description="Бизнес", invoke_without_command=True)
+    @commands.hybrid_group(name="business", aliases=["biz"], description="Бизнес", invoke_without_command=True)
     async def business(self, ctx):
         if not await self._require_module(ctx, "business", "Бизнес"): return
         await self._show_business(ctx)
@@ -1480,7 +1542,7 @@ class EconomyCog(commands.Cog):
             ])
 
     # ---------- КРЕДИТЫ ----------
-    @commands.hybrid_group(name="loan", description="Кредиты", invoke_without_command=True)
+    @commands.hybrid_group(name="loan", aliases=["ln"], description="Кредиты", invoke_without_command=True)
     async def loan(self, ctx):
         gid = ctx.guild.id
         data = await self.bot.get_balance(gid, ctx.author.id)
@@ -1606,7 +1668,7 @@ class EconomyCog(commands.Cog):
             ],
             thumbnail=ctx.guild.icon.url if ctx.guild.icon else None)
 
-    @commands.hybrid_command(name="print_money", description="Эмиссия в резерв ЦБ сервера")
+    @commands.hybrid_command(name="print-money", with_app_command=False, description="Эмиссия в резерв ЦБ сервера")
     @commands.has_permissions(administrator=True)
     async def print_money(self, ctx, amount: int):
         if amount <= 0:
@@ -1627,7 +1689,7 @@ class EconomyCog(commands.Cog):
             ],
             footer=f"Сервер: {ctx.guild.name}")
 
-    @commands.hybrid_command(name="burn_money", description="Сжечь средства из резерва ЦБ сервера")
+    @commands.hybrid_command(name="burn-money", with_app_command=False, description="Сжечь средства из резерва ЦБ сервера")
     @commands.has_permissions(administrator=True)
     async def burn_money(self, ctx, amount: int):
         if amount <= 0:
@@ -1645,7 +1707,7 @@ class EconomyCog(commands.Cog):
             fields=[("💸 Сожжено", f"`{fmt(amount)}`", True),
                     ("💎 Новый резерв", f"`{fmt(await self.bot.reserve(ctx.guild.id))}`", True)])
 
-    @commands.hybrid_command(name="setreportchannel", description="Канал ежедневных отчётов")
+    @commands.hybrid_command(name="set-report-channel", with_app_command=False, description="Канал ежедневных отчётов")
     @commands.has_permissions(administrator=True)
     @app_commands.describe(channel="Канал (по умолчанию текущий)")
     async def setreportchannel(self, ctx, channel: discord.TextChannel = None):
@@ -1656,7 +1718,7 @@ class EconomyCog(commands.Cog):
         await send_embed(ctx, "success", "Канал отчётов установлен",
                          f"Ежедневные отчёты будут приходить в {channel.mention} в {REPORT_HOUR_UTC:02d}:00 UTC.")
 
-    @commands.hybrid_command(name="setchartchannel", description="Канал автоматических графиков")
+    @commands.hybrid_command(name="set-chart-channel", with_app_command=False, description="Канал автоматических графиков")
     @commands.has_permissions(administrator=True)
     @app_commands.describe(channel="Канал (по умолчанию текущий)")
     async def setchartchannel(self, ctx, channel: discord.TextChannel = None):
@@ -1667,7 +1729,7 @@ class EconomyCog(commands.Cog):
         await send_embed(ctx, "success", "Канал графиков установлен",
                          f"Ежедневные графики будут приходить в {channel.mention}.")
 
-    @commands.hybrid_command(name="graphs", aliases=["chart"], description="Графики экономики сервера")
+    @commands.hybrid_command(name="graphs", aliases=["chart"], with_app_command=False, description="Графики экономики сервера")
     @commands.has_permissions(administrator=True)
     async def graphs(self, ctx):
         await ctx.defer()
@@ -1678,6 +1740,8 @@ class EconomyCog(commands.Cog):
                                     "Проверь этот канал.")
         await send_embed(ctx, "danger", "Не удалось отправить графики",
                          "Проверь права бота в этом канале.")
+
+
 # =============================================================================
 # КАЗИНО
 # =============================================================================
@@ -1872,7 +1936,8 @@ class BlackjackView(CasinoView):
                 await self.cog.settle_payout(self.guild_id, self.user_id, payout, "blackjack")
                 text += f"\nВыплата: **{fmt(payout)}**."
             except Exception:
-                log.exception("Не удалось выплатить выигрыш blackjack")
+                log.warning("Не удалось выплатить blackjack guild=%s uid=%s payout=%s",
+                            self.guild_id, self.user_id, payout, exc_info=True)
                 text += "\n⚠️ Ошибка выплаты — обратись к администратору."
         self.cog.active_bj.discard(self.key)
         self._lock_game_buttons(True)
@@ -2123,7 +2188,7 @@ class CasinoCog(commands.Cog):
 
     GAME_LABELS = {"slot": "🎰 Слоты", "russian_roulette": "🔫 Рулетка", "blackjack": "🃏 Блэкджек"}
 
-    @commands.hybrid_command(name="casinostats", aliases=["cstats"], description="Статистика казино игрока")
+    @commands.hybrid_command(name="casino-stats", aliases=["cs", "cstats"], description="Статистика казино игрока")
     @app_commands.describe(member="Чью статистику показать")
     async def casinostats(self, ctx, member: discord.Member = None):
         member = member or ctx.author
@@ -2152,7 +2217,7 @@ class CasinoCog(commands.Cog):
                          f"🎲 Казино — {member.display_name}", fields=fields,
                          thumbnail=member.display_avatar.url)
 
-    @commands.hybrid_command(name="slot", description="Слоты 3×3")
+    @commands.hybrid_command(name="slot", aliases=["sl"], description="Слоты 3×3")
     @app_commands.describe(bet="Ставка наличными или all")
     async def slot(self, ctx, bet: str):
         if not await self._require_module(ctx, "🎰 Казино"): return
@@ -2160,7 +2225,7 @@ class CasinoCog(commands.Cog):
         if bet is None: return
         await self._start_instant(ctx, "slot", bet)
 
-    @commands.hybrid_command(name="rr", description="Русская рулетка: шанс 1 к 6, выигрыш ×5")
+    @commands.hybrid_command(name="rr", aliases=["roulette"], description="Русская рулетка: шанс 1 к 6, выигрыш ×5")
     @app_commands.describe(bet="Ставка наличными или all")
     async def rr(self, ctx, bet: str):
         if not await self._require_module(ctx, "🎰 Казино"): return
@@ -2168,7 +2233,7 @@ class CasinoCog(commands.Cog):
         if bet is None: return
         await self._start_instant(ctx, "rr", bet)
 
-    @commands.hybrid_command(name="bj", description="Блэкджек")
+    @commands.hybrid_command(name="bj", aliases=["blackjack"], description="Блэкджек")
     @app_commands.describe(bet="Ставка наличными или all")
     async def bj(self, ctx, bet: str):
         if not await self._require_module(ctx, "🎰 Казино"): return
@@ -2206,54 +2271,11 @@ class CasinoCog(commands.Cog):
 
 
 # =============================================================================
-# ИИ-КОМАНДЫ
+# ИИ (управляется из панели /settings)
 # =============================================================================
-class AICog(commands.Cog):
-    def __init__(self, bot: EconomyBot):
-        self.bot = bot
-
-    async def guild_ai_enabled(self, guild_id: int) -> bool:
-        doc = await self.bot.settings.find_one({"_id": int(guild_id)}) or {}
-        return bool(doc.get("ai_enabled", True))
-
-    @commands.hybrid_command(name="ai_toggle", description="Включить/выключить ИИ-отчёты на сервере")
-    @commands.has_permissions(administrator=True)
-    @commands.guild_only()
-    async def ai_toggle(self, ctx):
-        new_state = not await self.guild_ai_enabled(ctx.guild.id)
-        await self.bot.settings.update_one(
-            {"_id": ctx.guild.id},
-            {"$set": {"ai_enabled": new_state, "updated_at": now()}},
-            upsert=True,
-        )
-        note = ""
-        if new_state and not self.bot.ai.enabled:
-            note = "\n⚠️ Но на стороне бота не задан `AI_API_KEY` или `GROQ_API_KEY`, поэтому ИИ фактически недоступен."
-        await send_embed(ctx, "success" if new_state else "warning",
-                         "🤖 ИИ-отчёты",
-                         f"На этом сервере: **{'включены' if new_state else 'выключены'}**.{note}")
-
-    @commands.hybrid_command(name="ai_report", description="ИИ-отчёт о состоянии экономики")
-    @commands.has_permissions(administrator=True)
-    @commands.guild_only()
-    async def ai_report(self, ctx):
-        if not self.bot.ai.enabled:
-            return await send_embed(ctx, "danger", "🤖 ИИ отключён",
-                                    "У бота не задан `GROQ_API_KEY`.")
-        if not await self.guild_ai_enabled(ctx.guild.id):
-            return await send_embed(ctx, "warning", "🤖 ИИ-отчёты выключены",
-                                    "Включить: `!ai_toggle`.")
-        await ctx.defer()
-        stats = await self.bot.stats(ctx.guild.id)
-        try:
-            text = await self.bot.ai.market_report(stats)
-        except AIError as e:
-            return await send_embed(ctx, "danger", "⚠️ Ошибка ИИ", str(e))
-        if len(text) > 1900:
-            text = text[:1900].rstrip() + "…"
-        await send_embed(ctx, "info", "🤖 ИИ-отчёт по экономике",
-                         description=text,
-                         thumbnail=ctx.guild.icon.url if ctx.guild.icon else None)
+async def guild_ai_enabled(bot, guild_id: int) -> bool:
+    doc = await bot.settings.find_one({"_id": int(guild_id)}) or {}
+    return bool(doc.get("ai_enabled", True))
 
 
 # =============================================================================
@@ -2358,8 +2380,57 @@ class ModuleToggleButton(discord.ui.Button):
         await self.view.refresh(interaction)
 
 
+class AIReportButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="ИИ-отчёт", emoji="🤖", style=discord.ButtonStyle.primary)
+
+    async def callback(self, interaction: discord.Interaction):
+        bot, guild = self.view.bot, self.view.guild
+        if not bot.ai.enabled:
+            return await send_embed(interaction, "danger", "🤖 ИИ отключён",
+                                    "У бота не задан `GROQ_API_KEY`.", ephemeral=True)
+        if not await guild_ai_enabled(bot, guild.id):
+            return await send_embed(interaction, "warning", "🤖 ИИ-отчёты выключены",
+                                    "Включи их кнопкой «Вкл/Выкл ИИ» в этой панели.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            stats = await bot.stats(guild.id)
+            text = await bot.ai.market_report(stats)
+        except AIError as e:
+            return await send_embed(interaction, "danger", "⚠️ Ошибка ИИ", str(e), ephemeral=True)
+        except Exception:
+            log.exception("Ошибка генерации ИИ-отчёта")
+            return await send_embed(interaction, "danger", "⚠️ Ошибка ИИ",
+                                    "Не удалось сформировать отчёт.", ephemeral=True)
+        if len(text) > 1900:
+            text = text[:1900].rstrip() + "…"
+        await send_embed(interaction, "info", "🤖 ИИ-отчёт по экономике",
+                         description=text,
+                         thumbnail=guild.icon.url if guild.icon else None,
+                         ephemeral=True)
+
+
+class AIToggleButton(discord.ui.Button):
+    def __init__(self, enabled: bool):
+        super().__init__(label="Вкл/Выкл ИИ", emoji="🧠",
+                         style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger)
+
+    async def callback(self, interaction: discord.Interaction):
+        bot, guild = self.view.bot, self.view.guild
+        new_state = not await guild_ai_enabled(bot, guild.id)
+        await bot.settings.update_one(
+            {"_id": guild.id},
+            {"$set": {"ai_enabled": new_state, "updated_at": now()}},
+            upsert=True)
+        bot.invalidate_settings(guild.id)
+        log.info("Guild %s: ИИ -> %s", guild.id, new_state)
+        await self.view.refresh(interaction)
+        if new_state and not bot.ai.enabled:
+            await reply_ephemeral(interaction, "⚠️ Включено, но у бота не задан `AI_API_KEY`/`GROQ_API_KEY` — ИИ недоступен.")
+
+
 class SettingsView(discord.ui.View):
-    def __init__(self, bot, author_id: int, guild: discord.Guild, cfg: dict):
+    def __init__(self, bot, author_id: int, guild: discord.Guild, cfg: dict, ai_enabled: bool = True):
         super().__init__(timeout=300)
         self.bot = bot
         self.author_id = author_id
@@ -2376,6 +2447,8 @@ class SettingsView(discord.ui.View):
             btn = ModuleToggleButton(module, label, emoji)
             btn.style = discord.ButtonStyle.success if mods.get(module, True) else discord.ButtonStyle.secondary
             self.add_item(btn)
+        self.add_item(AIReportButton())
+        self.add_item(AIToggleButton(ai_enabled))
 
     async def interaction_check(self, interaction: discord.Interaction):
         perms = getattr(interaction.user, "guild_permissions", None)
@@ -2386,7 +2459,8 @@ class SettingsView(discord.ui.View):
 
     async def refresh(self, interaction: discord.Interaction):
         cfg = await self.bot.get_settings(self.guild.id)
-        new_view = SettingsView(self.bot, self.author_id, self.guild, cfg)
+        ai_on = await guild_ai_enabled(self.bot, self.guild.id)
+        new_view = SettingsView(self.bot, self.author_id, self.guild, cfg, ai_on)
         embed = settings_embed(self.guild, cfg)
         try:
             await interaction.response.edit_message(embed=embed, view=new_view)
@@ -2478,7 +2552,8 @@ class SettingsCog(commands.Cog):
     @commands.guild_only()
     async def settings_panel(self, ctx):
         cfg = await self.bot.get_settings(ctx.guild.id)
-        view = SettingsView(self.bot, ctx.author.id, ctx.guild, cfg)
+        ai_on = await guild_ai_enabled(self.bot, ctx.guild.id)
+        view = SettingsView(self.bot, ctx.author.id, ctx.guild, cfg, ai_on)
         view.message = await safe_send(ctx, embed=settings_embed(ctx.guild, cfg), view=view, ephemeral=True)
 
 
