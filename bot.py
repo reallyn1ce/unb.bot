@@ -1,5 +1,7 @@
 import os
+import io
 import json
+import math
 import asyncio
 import logging
 import urllib.parse
@@ -21,7 +23,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import FuncFormatter
 
-BOT_VERSION = "7.1.0"
+BOT_VERSION = "7.2.0"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_USER = os.getenv("MONGO_USER")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
@@ -61,6 +63,17 @@ PLAY_AGAIN_TIMEOUT = 120
 COIN_EMOJI = "🪙"
 BJ_TIMEOUT = 90
 
+# ====================== БИРЖА ======================
+STOCK_CREATE_COST = 100_000        # стоимость IPO (уходит в резерв ЦБ)
+STOCK_START_PRICE = 100.0
+STOCK_START_SUPPLY = 1000          # акций выпускается при IPO
+STOCK_TRADE_STEP = 0.01            # ±1% цены за сделку
+STOCK_TICK_MAX = 0.03              # случайное движение раз в тик: ±3%
+STOCK_TICK_MINUTES = 30
+STOCK_HISTORY_MAX = 5000           # точек истории на акцию
+STOCK_TRADE_COOLDOWN = 10          # сек между сделками одного игрока (анти-памп)
+STOCK_TICKER_RE = re.compile(r"^[A-ZА-ЯЁ0-9]{2,6}$")
+
 # ====================== ПРЕСЕТЫ ======================
 _H = 3600
 PRESETS = {
@@ -74,6 +87,7 @@ PRESETS = {
             "tax_rate": 0.0, "work_min": 500, "work_max": 1500,
             "loan_interest": 0.0, "loan_penalty": 0.0,
             "business_tax": 0.0, "daily_min": 300, "daily_max": 500,
+            "inflation_multiplier": 0.0,
         },
     },
     "standard": {
@@ -86,6 +100,7 @@ PRESETS = {
             "tax_rate": 0.13, "work_min": 200, "work_max": 700,
             "loan_interest": 0.20, "loan_penalty": 0.05,
             "business_tax": 0.05, "daily_min": 300, "daily_max": 500,
+            "inflation_multiplier": 0.5,
         },
     },
     "hardcore": {
@@ -98,6 +113,7 @@ PRESETS = {
             "tax_rate": 0.30, "work_min": 50, "work_max": 150,
             "loan_interest": 0.50, "loan_penalty": 0.10,
             "business_tax": 0.10, "daily_min": 300, "daily_max": 500,
+            "inflation_multiplier": 1.0,
         },
     },
 }
@@ -106,7 +122,8 @@ DEFAULT_SETTINGS = dict(PRESETS[DEFAULT_PRESET]["values"])
 COOLDOWN_KEYS = ("work", "crime", "slut", "rob", "daily")
 
 # Модули по умолчанию — все включены
-DEFAULT_MODULES = {"business": True, "casino": True, "crime": True}
+DEFAULT_MODULES = {"business": True, "casino": True, "crime": True,
+                   "stocks": True, "daily": True}
 
 SETTING_SPECS = {
     "cooldown_work": ("duration", 0, COOLDOWN_MAX, "Кулдаун !work", "4h, 30m, 90s или 0"),
@@ -434,6 +451,8 @@ class EconomyBot(commands.Bot):
         self.history = None
         self.settings = None
         self.casino_stats = None
+        self.stocks = None
+        self.stock_holdings = None
         self.ai = AIHandler()
         self._settings_cache = {}
         self.add_check(guild_only_check)
@@ -476,6 +495,8 @@ class EconomyBot(commands.Bot):
         self.history = self.db.economy_history
         self.settings = self.db.guild_settings
         self.casino_stats = self.db.casino_stats
+        self.stocks = self.db.stocks
+        self.stock_holdings = self.db.stock_holdings
 
         await self.migrate_legacy()
         await safe_create_index(self.history, "created_at")
@@ -488,6 +509,9 @@ class EconomyBot(commands.Bot):
                                 unique=True, drop_on_conflict=True)
         await safe_create_index(self.casino_stats, [("guild_id", 1), ("user_id", 1)],
                                 unique=True, drop_on_conflict=True)
+        await safe_create_index(self.stocks, "guild_id")
+        await safe_create_index(self.stock_holdings, [("guild_id", 1), ("user_id", 1), ("ticker", 1)],
+                                unique=True, drop_on_conflict=True)
         await safe_create_index(self.economy, "_id")
         await safe_create_index(self.funds, "_id")
 
@@ -497,6 +521,7 @@ class EconomyBot(commands.Bot):
 
         await self.add_cog(EconomyCog(self))
         await self.add_cog(CasinoCog(self))
+        await self.add_cog(StockCog(self))
         await self.add_cog(SettingsCog(self))
 
         if not self.ai.enabled:
@@ -511,9 +536,11 @@ class EconomyBot(commands.Bot):
         self.loan_loop.start()
         self.snapshot_loop.start()
         self.daily_report_loop.start()
+        self.stock_loop.start()
 
     async def close(self):
-        for loop in (self.business_loop, self.loan_loop, self.snapshot_loop, self.daily_report_loop):
+        for loop in (self.business_loop, self.loan_loop, self.snapshot_loop,
+                     self.daily_report_loop, self.stock_loop):
             if loop.is_running(): loop.cancel()
         try: await self.ai.close()
         except Exception: log.exception("AI close error")
@@ -624,6 +651,10 @@ class EconomyBot(commands.Bot):
         if preset not in PRESETS and preset != "custom":
             preset = "custom" if legacy_used else DEFAULT_PRESET
         cfg["preset"] = preset
+        # Старые документы без inflation_multiplier: берём значение из пресета гильдии
+        if preset in PRESETS and "inflation_multiplier" not in eco:
+            cfg["inflation_multiplier"] = PRESETS[preset]["values"]["inflation_multiplier"]
+        cfg["inflation_multiplier"] = float(cfg["inflation_multiplier"])
         # Модули
         mods = doc.get("modules") or {}
         cfg["modules"] = {k: bool(mods.get(k, v)) for k, v in DEFAULT_MODULES.items()}
@@ -827,15 +858,43 @@ class EconomyBot(commands.Bot):
                         "source": {"$regex": "^user_"}}},
             {"$group": {"_id": None, "n": {"$sum": "$amount"}}},
         ]).to_list(1)
+        printed = int((await self.economy.find_one({"_id": self.cb_id(gid)}) or {}).get("printed", 0))
+        supply = reserve + players + budget
         return {
             "reserve": reserve, "budget": budget,
             "players": players, "player_debt": player_debt,
             "circulation": players + budget,
-            "debt": max(0, -reserve), "supply": reserve + players + budget,
-            "printed": int((await self.economy.find_one({"_id": self.cb_id(gid)}) or {}).get("printed", 0)),
+            "debt": max(0, -reserve), "supply": supply,
+            "printed": printed,
+            "inflation": self.calc_inflation(printed, supply),
             "incoming": int(incoming[0]["n"]) if incoming else 0,
             "outgoing": int(outgoing[0]["n"]) if outgoing else 0,
         }
+
+    @staticmethod
+    def calc_inflation(printed, supply) -> float:
+        """inflation = max(0, (printed / (reserve + players + budget) - 1) * 100)."""
+        if supply <= 0:
+            return 0.0
+        return max(0.0, (printed / supply - 1.0) * 100)
+
+    @staticmethod
+    def inflation_factor(inflation, multiplier) -> float:
+        return max(0.0, 1.0 - float(inflation) * 0.01 * float(multiplier))
+
+    async def current_inflation(self, guild_id) -> float:
+        """Лёгкий расчёт инфляции (без 24ч-агрегаций по журналу транзакций)."""
+        gid = int(guild_id)
+        reserve = await self.reserve(gid)
+        budget = await self.fund_balance(gid)
+        rows = await self.db_users.aggregate([
+            {"$match": {"guild_id": gid}},
+            {"$group": {"_id": None, "cash": {"$sum": "$cash"}, "bank": {"$sum": "$bank"}}},
+        ]).to_list(1)
+        p = rows[0] if rows else {}
+        players = int(p.get("cash", 0)) + int(p.get("bank", 0))
+        printed = int((await self.economy.find_one({"_id": self.cb_id(gid)}) or {}).get("printed", 0))
+        return self.calc_inflation(printed, reserve + players + budget)
 
     async def snapshot(self):
         """Делаем снапшоты по всем серверам."""
@@ -850,11 +909,11 @@ class EconomyBot(commands.Bot):
                 log.exception("Snapshot failed for guild %s", guild.id)
 
     @staticmethod
-    def _render_chart(rows, path):
+    def _render_chart(rows, path, value_key="circulation", decimals=0, xfmt="%H:%M"):
         """Тёмный график «в стиле Discord»: зелёная линия + полупрозрачная заливка."""
         bg, fg, grid, green = "#2f3136", "#b9bbbe", "#ffffff", "#2ecc71"
         dates = [as_utc(r["created_at"]) for r in rows]
-        values = [int(r.get("circulation", 0)) for r in rows]
+        values = [float(r.get(value_key, 0)) for r in rows]
         fig, ax = plt.subplots(figsize=(9, 4.5))
         fig.patch.set_facecolor(bg)
         ax.set_facecolor(bg)
@@ -869,9 +928,11 @@ class EconomyBot(commands.Bot):
         for side in ("top", "right", "left", "bottom"):
             ax.spines[side].set_visible(False)
         ax.tick_params(colors=fg, length=0, labelsize=9)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter(xfmt))
         ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8))
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: fmt(v)))
+        ax.yaxis.set_major_formatter(FuncFormatter(
+            (lambda v, _pos: fmt(v)) if decimals == 0
+            else (lambda v, _pos: f"{v:,.{decimals}f}".replace(",", " "))))
         fig.tight_layout()
         fig.savefig(path, dpi=120, facecolor=bg)
         plt.close(fig)
@@ -925,6 +986,10 @@ class EconomyBot(commands.Bot):
             try:
                 cfg = await self.get_settings(gid)
                 income = business_income(level)
+                infl_mult = float(cfg.get("inflation_multiplier", 0.0))
+                if infl_mult > 0:
+                    inflation = await self.current_inflation(gid)
+                    income = int(income * self.inflation_factor(inflation, infl_mult))
                 tax = business_tax(level, cfg["business_tax"])
                 async with await self.mongo.start_session() as session:
                     async with session.start_transaction():
@@ -997,6 +1062,38 @@ class EconomyBot(commands.Bot):
 
     @loan_loop.before_loop
     async def before_loan_loop(self): await self.wait_until_ready()
+
+    @tasks.loop(minutes=STOCK_TICK_MINUTES)
+    async def stock_loop(self):
+        """Раз в 30 минут: случайное движение цен на ±3% + запись в history."""
+        current = now()
+        async for st in self.stocks.find({}):
+            try:
+                gid = int(st.get("guild_id", 0))
+                if not gid or not await self.module_enabled(gid, "stocks"):
+                    continue
+                last = as_utc(st.get("last_tick"))
+                # защита от лишнего тика при перезапуске бота
+                if last and (current - last).total_seconds() < (STOCK_TICK_MINUTES - 1) * 60:
+                    continue
+                for _attempt in range(3):
+                    pct = rng.uniform(-STOCK_TICK_MAX, STOCK_TICK_MAX)
+                    price = max(1.0, round(float(st["price"]) * (1 + pct), 2))
+                    res = await self.stocks.update_one(
+                        {"_id": st["_id"], "price": st["price"]},   # не затираем параллельную сделку
+                        {"$set": {"price": price, "last_tick": current, "updated_at": current},
+                         "$push": {"history": {"$each": [price], "$slice": -STOCK_HISTORY_MAX},
+                                   "history_ts": {"$each": [current], "$slice": -STOCK_HISTORY_MAX}}})
+                    if res.modified_count == 1:
+                        break
+                    st = await self.stocks.find_one({"_id": st["_id"]})
+                    if not st:
+                        break
+            except Exception:
+                log.exception("Stock tick failed %s", st.get("_id") if st else None)
+
+    @stock_loop.before_loop
+    async def before_stock_loop(self): await self.wait_until_ready()
 
     @tasks.loop(minutes=5)
     async def snapshot_loop(self):
@@ -1100,6 +1197,12 @@ class EconomyCog(commands.Cog):
                          "Включить можно через `/settings`.")
         return False
 
+    async def _inflation_fields(self, guild_id, s):
+        cfg = await self.bot.get_settings(guild_id)
+        if cfg.get("preset") == "easy":
+            return []
+        return [("📈 Инфляция", f"`{s['inflation']:.2f}%`", True)]
+
     @commands.hybrid_command(name="help", aliases=["h"], description="Команды экономики")
     async def help_command(self, ctx):
         await send_embed(ctx, "info", "Справка по экономике",
@@ -1119,6 +1222,9 @@ class EconomyCog(commands.Cog):
                  "`!top` — топ-10\n`!economy` — экономика сервера\n`!cb` — ЦБ сервера", False),
                 ("🎰 Казино",
                  "`!slot ставка` `!bj ставка` `!rr ставка`\n`!casinostats [@user]`", False),
+                ("📈 Биржа",
+                 "`!stock create ТИКЕР Название` — IPO (100 000)\n`!stock info ТИКЕР` — профиль и графики\n"
+                 "`!stock list` — все акции\n`!buy ТИКЕР кол-во` `!sell ТИКЕР кол-во|all`", False),
                 ("⚙️ Админ",
                  "`/settings` — панель\n`!graphs` — графики\n🤖 ИИ — кнопки в `/settings`", False),
             ],
@@ -1162,6 +1268,13 @@ class EconomyCog(commands.Cog):
         cooldown = cfg["cooldown_work"]
         low, high = sorted((cfg["work_min"], cfg["work_max"]))
         gross = random.randint(low, high)
+        infl_cut = 0.0
+        infl_mult = float(cfg.get("inflation_multiplier", 0.0))
+        if infl_mult > 0:
+            inflation = await self.bot.current_inflation(gid)
+            factor = self.bot.inflation_factor(inflation, infl_mult)
+            gross = int(gross * factor)
+            infl_cut = (1 - factor) * 100
         try:
             async with await self.bot.mongo.start_session() as session:
                 async with session.start_transaction():
@@ -1175,6 +1288,8 @@ class EconomyCog(commands.Cog):
             return await send_embed(ctx, "warning", "Ты устал",
                                     f"Следующая работа через **{fmt_duration(remaining)}**.")
         fields = [("💰 Начислено", f"`{fmt(gross)}`", True)]
+        if infl_cut > 0:
+            fields.append(("📉 Инфляция", f"`-{infl_cut:.1f}%` к зарплате", True))
         if tax > 0:
             fields.append(("🧾 НДФЛ", f"`{fmt(tax)}` ({fmt_pct(cfg['tax_rate'])})", True))
         fields.append(("✅ На руки", f"`{fmt(net)}`", True))
@@ -1256,6 +1371,7 @@ class EconomyCog(commands.Cog):
             await self._daily(ctx)
 
     async def _daily(self, ctx):
+        if not await self._require_module(ctx, "daily", "Ежедневный бонус"): return
         gid, uid = ctx.guild.id, ctx.author.id
         await self.bot.ensure_user(gid, uid)
         cfg = await self.bot.get_settings(gid)
@@ -1573,7 +1689,12 @@ class EconomyCog(commands.Cog):
             return await send_embed(ctx, "danger", "Ошибка",
                                     "Новый кредит недоступен, пока не погашен текущий долг.")
         cfg = await self.bot.get_settings(gid)
-        owed = int(amount * (1 + cfg["loan_interest"]))
+        rate = float(cfg["loan_interest"])
+        infl_mult = float(cfg.get("inflation_multiplier", 0.0))
+        if infl_mult > 0:
+            # процент растёт на inflation * 0.01 (с учётом множителя пресета)
+            rate += await self.bot.current_inflation(gid) * 0.01 * infl_mult
+        owed = int(amount * (1 + rate))
         due_at = now() + timedelta(seconds=LOAN_TERM)
         try:
             async with await self.bot.mongo.start_session() as session:
@@ -1594,7 +1715,7 @@ class EconomyCog(commands.Cog):
             return await send_embed(ctx, "danger", "Ошибка", str(e))
         fields = [
             ("💰 Получено", f"`{fmt(amount)}`", True),
-            ("💳 К возврату", f"`{fmt(owed)}` ({fmt_pct(cfg['loan_interest'])})", True),
+            ("💳 К возврату", f"`{fmt(owed)}` ({fmt_pct(rate)})", True),
             ("📅 Срок", f"<t:{int(due_at.timestamp())}:f>", False),
         ]
         if cfg["loan_penalty"] > 0:
@@ -1642,6 +1763,7 @@ class EconomyCog(commands.Cog):
     @commands.hybrid_command(name="cb", description="Центральный банк сервера")
     async def cb(self, ctx):
         s = await self.bot.stats(ctx.guild.id)
+        extra = await self._inflation_fields(ctx.guild.id, s)
         await send_embed(ctx, "info", f"🏦 ЦБ — {ctx.guild.name}",
             fields=[
                 ("💎 Резерв", f"`{fmt(s['reserve'])}`", True),
@@ -1650,13 +1772,14 @@ class EconomyCog(commands.Cog):
                 ("🪙 В обращении", f"`{fmt(s['circulation'])}`", True),
                 ("📉 Дефицит ЦБ", f"`{fmt(s['debt'])}`", True),
                 ("🖨️ Напечатано", f"`{fmt(s['printed'])}`", True),
-            ],
+            ] + extra,
             thumbnail=ctx.guild.icon.url if ctx.guild.icon else None,
             footer="Экономика изолирована — у каждого сервера свой ЦБ")
 
     @commands.hybrid_command(name="economy", description="Статистика сервера")
     async def economy(self, ctx):
         s = await self.bot.stats(ctx.guild.id)
+        extra = await self._inflation_fields(ctx.guild.id, s)
         await send_embed(ctx, "info", f"📈 Экономика — {ctx.guild.name}",
             fields=[
                 ("👥 Игроки", f"`{fmt(s['players'])}`", True),
@@ -1665,7 +1788,7 @@ class EconomyCog(commands.Cog):
                 ("↘️ Расход 24ч", f"`{fmt(s['outgoing'])}`", True),
                 ("🏦 Резерв ЦБ", f"`{fmt(s['reserve'])}`", True),
                 ("💰 Госбюджет", f"`{fmt(s['budget'])}`", True),
-            ],
+            ] + extra,
             thumbnail=ctx.guild.icon.url if ctx.guild.icon else None)
 
     @commands.hybrid_command(name="print-money", with_app_command=False, description="Эмиссия в резерв ЦБ сервера")
@@ -2271,6 +2394,323 @@ class CasinoCog(commands.Cog):
 
 
 # =============================================================================
+# БИРЖА
+# =============================================================================
+def stock_sid(guild_id, ticker) -> str:
+    """_id акции. Привязан к серверу, чтобы экономика серверов оставалась изолированной."""
+    return f"{int(guild_id)}:{ticker}"
+
+def hkey(guild_id, user_id, ticker) -> dict:
+    return {"guild_id": int(guild_id), "user_id": int(user_id), "ticker": ticker}
+
+def fmt_price(value) -> str:
+    return f"{float(value):,.2f}".replace(",", " ")
+
+def stock_rows(st) -> list:
+    """История акции -> строки для _render_chart (created_at + price), с текущей ценой в конце."""
+    hist = [float(x) for x in (st.get("history") or [])]
+    ts = [as_utc(t) for t in (st.get("history_ts") or [])]
+    if len(ts) != len(hist) or any(t is None for t in ts):
+        end, n = now(), len(hist)
+        ts = [end - timedelta(minutes=STOCK_TICK_MINUTES * (n - 1 - i)) for i in range(n)]
+    rows = [{"created_at": t, "price": p} for t, p in zip(ts, hist)]
+    rows.append({"created_at": now(), "price": float(st["price"])})
+    return rows
+
+def stock_change_24h(rows, current) -> float:
+    cutoff = now() - timedelta(hours=24)
+    base = rows[0]["price"] if rows else current
+    for r in rows[:-1]:
+        if r["created_at"] <= cutoff:
+            base = r["price"]
+        else:
+            break
+    return (current / base - 1) * 100 if base > 0 else 0.0
+
+
+class StockCog(commands.Cog):
+    def __init__(self, bot: EconomyBot):
+        self.bot = bot
+        self._last_trade = {}
+
+    async def _require_module(self, ctx) -> bool:
+        if await self.bot.module_enabled(ctx.guild.id, "stocks"):
+            return True
+        await send_embed(ctx, "danger", "Биржа отключена",
+                         "Администратор сервера выключил этот модуль. Включить можно через `/settings`.")
+        return False
+
+    def _throttle(self, gid, uid) -> float:
+        key, t = (gid, uid), time.monotonic()
+        left = STOCK_TRADE_COOLDOWN - (t - self._last_trade.get(key, -1e9))
+        if left > 0:
+            return left
+        self._last_trade[key] = t
+        return 0.0
+
+    @staticmethod
+    def _parse_ticker(raw) -> str:
+        return str(raw or "").strip().upper()
+
+    async def _get_stock(self, gid, ticker):
+        return await self.bot.stocks.find_one({"_id": stock_sid(gid, ticker)})
+
+    # ---------- группа ----------
+    @commands.hybrid_group(name="stock", aliases=["stocks"], description="Биржа", invoke_without_command=True)
+    async def stock(self, ctx):
+        if not await self._require_module(ctx): return
+        await self._list(ctx)
+
+    @stock.command(name="list", description="Все акции сервера")
+    async def stock_list(self, ctx):
+        if not await self._require_module(ctx): return
+        await self._list(ctx)
+
+    async def _list(self, ctx):
+        docs = await self.bot.stocks.find({"guild_id": ctx.guild.id}).to_list(500)
+        if not docs:
+            return await send_embed(ctx, "info", "📈 Биржа",
+                f"Пока нет ни одной акции.\n`!stock create ТИКЕР Название` — IPO за {fmt(STOCK_CREATE_COST)}.")
+        docs.sort(key=lambda d: float(d["price"]) * int(d.get("supply", 0)), reverse=True)
+        lines = []
+        for d in docs[:15]:
+            rows = stock_rows(d)
+            ch = stock_change_24h(rows, float(d["price"]))
+            lines.append(f"**{d['ticker']}** — {d['name']}: `{fmt_price(d['price'])}` ({ch:+.1f}%)")
+        await send_embed(ctx, "info", "📈 Биржа", "\n".join(lines),
+                         footer="Подробности: !stock info ТИКЕР")
+
+    # ---------- IPO ----------
+    @stock.command(name="create", description="Выпустить акции своей компании (IPO)")
+    @app_commands.describe(ticker="Тикер (2–6 символов)", name="Название компании")
+    async def stock_create(self, ctx, ticker: str, *, name: str):
+        if not await self._require_module(ctx): return
+        gid, uid = ctx.guild.id, ctx.author.id
+        ticker, name = self._parse_ticker(ticker), name.strip()
+        if not STOCK_TICKER_RE.match(ticker):
+            return await send_embed(ctx, "danger", "Неверный тикер",
+                                    "Тикер: 2–6 символов, только буквы и цифры.")
+        if not 2 <= len(name) <= 40:
+            return await send_embed(ctx, "danger", "Неверное название", "Название: от 2 до 40 символов.")
+        sid, created = stock_sid(gid, ticker), now()
+        try:
+            async with await self.bot.mongo.start_session() as session:
+                async with session.start_transaction():
+                    if await self.bot.stocks.find_one({"_id": sid}, session=session):
+                        raise EconomyError(f"Тикер `{ticker}` уже занят на этом сервере.")
+                    if not await self.bot.change_cash(gid, uid, -STOCK_CREATE_COST, session=session):
+                        raise EconomyError(f"Для IPO нужно `{fmt(STOCK_CREATE_COST)}` наличными.")
+                    # деньги «сгорают» в резерв ЦБ — масса не меняется
+                    await self.bot.change_reserve(gid, STOCK_CREATE_COST, session=session)
+                    await self.bot.stocks.insert_one({
+                        "_id": sid, "guild_id": gid, "ticker": ticker, "name": name,
+                        "owner_id": uid, "price": STOCK_START_PRICE, "supply": STOCK_START_SUPPLY,
+                        "history": [STOCK_START_PRICE], "history_ts": [created],
+                        "last_tick": created, "created_at": created}, session=session)
+                    await self.bot.stock_holdings.insert_one({
+                        **hkey(gid, uid, ticker), "shares": STOCK_START_SUPPLY,
+                        "updated_at": created}, session=session)
+                    await self.bot.journal(f"user_{uid}", "central_bank", STOCK_CREATE_COST,
+                                           f"IPO: выпуск акций {ticker}",
+                                           {"type": "stock_ipo", "ticker": ticker},
+                                           session=session, guild_id=gid)
+        except DuplicateKeyError:
+            return await send_embed(ctx, "danger", "Ошибка", f"Тикер `{ticker}` уже занят.")
+        except EconomyError as e:
+            return await send_embed(ctx, "danger", "IPO не состоялось", str(e))
+        await send_embed(ctx, "success", f"🚀 IPO: {ticker}",
+            description=f"Компания **{name}** вышла на биржу.",
+            fields=[("💵 Цена акции", f"`{fmt_price(STOCK_START_PRICE)}`", True),
+                    ("📦 Твои акции", f"`{fmt(STOCK_START_SUPPLY)}`", True),
+                    ("🔥 Сгорело в резерв ЦБ", f"`{fmt(STOCK_CREATE_COST)}`", True)],
+            thumbnail=ctx.author.display_avatar.url)
+
+    # ---------- торговля ----------
+    @commands.hybrid_command(name="buy", description="Купить акции")
+    @app_commands.describe(ticker="Тикер", amount="Количество акций")
+    async def stock_buy(self, ctx, ticker: str, amount: int):
+        if not await self._require_module(ctx): return
+        gid, uid = ctx.guild.id, ctx.author.id
+        ticker = self._parse_ticker(ticker)
+        if amount <= 0 or amount > 1_000_000:
+            return await send_embed(ctx, "danger", "Ошибка", "Количество должно быть положительным.")
+        left = self._throttle(gid, uid)
+        if left > 0:
+            return await send_embed(ctx, "warning", "Не так быстро",
+                                    f"Следующая сделка через **{fmt_duration(left)}**.")
+        sid = stock_sid(gid, ticker)
+        try:
+            async with await self.bot.mongo.start_session() as session:
+                async with session.start_transaction():
+                    st = await self.bot.stocks.find_one({"_id": sid}, session=session)
+                    if not st:
+                        raise EconomyError(f"Акция `{ticker}` не найдена.")
+                    owner = int(st["owner_id"])
+                    if owner == uid:
+                        raise EconomyError("Нельзя торговать акциями собственной компании.")
+                    held = await self.bot.stock_holdings.find_one(hkey(gid, owner, ticker), session=session)
+                    available = int((held or {}).get("shares", 0))
+                    if amount > available:
+                        raise EconomyError(f"У эмитента в продаже только `{fmt(available)}` акций.")
+                    # Покупка поднимает цену на 1%; исполняем по цене ПОСЛЕ сдвига,
+                    # поэтому цикл «купил-продал» никогда не даёт прибыли.
+                    new_price = max(1.0, round(float(st["price"]) * (1 + STOCK_TRADE_STEP), 2))
+                    cost = math.ceil(new_price * amount)
+                    upd = await self.bot.stocks.update_one(
+                        {"_id": sid, "price": st["price"]},
+                        {"$set": {"price": new_price, "updated_at": now()}}, session=session)
+                    if upd.modified_count != 1:
+                        raise EconomyError("Цена изменилась во время сделки. Повтори команду.")
+                    await self.bot.ensure_user(gid, owner, session=session)
+                    paid = await self.bot.db_users.update_one(
+                        {**ukey(gid, uid), "cash": {"$gte": cost}},
+                        {"$inc": {"cash": -cost}, "$set": {"updated_at": now()}}, session=session)
+                    if paid.modified_count != 1:
+                        raise EconomyError(f"Недостаточно наличных. Нужно `{fmt(cost)}`.")
+                    # деньги идут владельцу акции
+                    await self.bot.db_users.update_one(
+                        ukey(gid, owner),
+                        {"$inc": {"cash": cost}, "$set": {"updated_at": now()}}, session=session)
+                    took = await self.bot.stock_holdings.update_one(
+                        {**hkey(gid, owner, ticker), "shares": {"$gte": amount}},
+                        {"$inc": {"shares": -amount}, "$set": {"updated_at": now()}}, session=session)
+                    if took.modified_count != 1:
+                        raise EconomyError("Акции эмитента уже раскуплены.")
+                    await self.bot.stock_holdings.update_one(
+                        hkey(gid, uid, ticker),
+                        {"$inc": {"shares": amount}, "$set": {"updated_at": now()}},
+                        upsert=True, session=session)
+                    await self.bot.journal(f"user_{uid}", f"user_{owner}", cost,
+                                           f"Покупка акций {ticker}",
+                                           {"type": "stock_buy", "ticker": ticker,
+                                            "shares": amount, "price": new_price},
+                                           session=session, guild_id=gid)
+        except EconomyError as e:
+            return await send_embed(ctx, "danger", "Покупка не удалась", str(e))
+        await send_embed(ctx, "success", f"📈 Куплено: {ticker}",
+            fields=[("📦 Акций", f"`{fmt(amount)}`", True),
+                    ("💵 Цена за акцию", f"`{fmt_price(new_price)}`", True),
+                    ("💸 Итого", f"`{fmt(cost)}`", True)],
+            footer=f"Деньги получил владелец: {st['name']}")
+
+    @commands.hybrid_command(name="sell", description="Продать акции")
+    @app_commands.describe(ticker="Тикер", amount="Количество или all")
+    async def stock_sell(self, ctx, ticker: str, amount: str):
+        if not await self._require_module(ctx): return
+        gid, uid = ctx.guild.id, ctx.author.id
+        ticker = self._parse_ticker(ticker)
+        mine = await self.bot.stock_holdings.find_one(hkey(gid, uid, ticker))
+        qty = parse_amount(amount, int((mine or {}).get("shares", 0)))
+        if not qty:
+            return await send_embed(ctx, "danger", "Ошибка",
+                                    "Укажи положительное количество акций или `all`.")
+        left = self._throttle(gid, uid)
+        if left > 0:
+            return await send_embed(ctx, "warning", "Не так быстро",
+                                    f"Следующая сделка через **{fmt_duration(left)}**.")
+        sid = stock_sid(gid, ticker)
+        try:
+            async with await self.bot.mongo.start_session() as session:
+                async with session.start_transaction():
+                    st = await self.bot.stocks.find_one({"_id": sid}, session=session)
+                    if not st:
+                        raise EconomyError(f"Акция `{ticker}` не найдена.")
+                    owner = int(st["owner_id"])
+                    if owner == uid:
+                        raise EconomyError("Нельзя торговать акциями собственной компании.")
+                    # Продажа понижает цену на 1% (не ниже 1); исполняем по цене после сдвига.
+                    new_price = max(1.0, round(float(st["price"]) * (1 - STOCK_TRADE_STEP), 2))
+                    proceeds = max(1, math.floor(new_price * qty))
+                    upd = await self.bot.stocks.update_one(
+                        {"_id": sid, "price": st["price"]},
+                        {"$set": {"price": new_price, "updated_at": now()}}, session=session)
+                    if upd.modified_count != 1:
+                        raise EconomyError("Цена изменилась во время сделки. Повтори команду.")
+                    await self.bot.ensure_user(gid, owner, session=session)
+                    taken = await self.bot.stock_holdings.update_one(
+                        {**hkey(gid, uid, ticker), "shares": {"$gte": qty}},
+                        {"$inc": {"shares": -qty}, "$set": {"updated_at": now()}}, session=session)
+                    if taken.modified_count != 1:
+                        raise EconomyError("У тебя недостаточно акций.")
+                    # Выкупает эмитент: платит из своих наличных, акции возвращаются к нему.
+                    paid = await self.bot.db_users.update_one(
+                        {**ukey(gid, owner), "cash": {"$gte": proceeds}},
+                        {"$inc": {"cash": -proceeds}, "$set": {"updated_at": now()}}, session=session)
+                    if paid.modified_count != 1:
+                        raise EconomyError("У эмитента недостаточно наличных для выкупа.")
+                    await self.bot.ensure_user(gid, uid, session=session)
+                    await self.bot.db_users.update_one(
+                        ukey(gid, uid),
+                        {"$inc": {"cash": proceeds}, "$set": {"updated_at": now()}}, session=session)
+                    await self.bot.stock_holdings.update_one(
+                        hkey(gid, owner, ticker),
+                        {"$inc": {"shares": qty}, "$set": {"updated_at": now()}},
+                        upsert=True, session=session)
+                    await self.bot.journal(f"user_{owner}", f"user_{uid}", proceeds,
+                                           f"Продажа акций {ticker}",
+                                           {"type": "stock_sell", "ticker": ticker,
+                                            "shares": qty, "price": new_price},
+                                           session=session, guild_id=gid)
+        except EconomyError as e:
+            return await send_embed(ctx, "danger", "Продажа не удалась", str(e))
+        await send_embed(ctx, "success", f"📉 Продано: {ticker}",
+            fields=[("📦 Акций", f"`{fmt(qty)}`", True),
+                    ("💵 Цена за акцию", f"`{fmt_price(new_price)}`", True),
+                    ("💰 Получено", f"`{fmt(proceeds)}`", True)])
+
+    # ---------- профиль и графики ----------
+    @stock.command(name="info", description="Профиль акции и графики")
+    @app_commands.describe(ticker="Тикер")
+    async def stock_info(self, ctx, ticker: str):
+        if not await self._require_module(ctx): return
+        async with ctx.typing():
+            await self._info(ctx, self._parse_ticker(ticker))
+
+    async def _info(self, ctx, ticker):
+        gid = ctx.guild.id
+        st = await self._get_stock(gid, ticker)
+        if not st:
+            return await send_embed(ctx, "danger", "Акция не найдена", f"Тикер `{ticker}` не существует.")
+        price = float(st["price"])
+        rows = stock_rows(st)
+        change = stock_change_24h(rows, price)
+        cap = price * int(st.get("supply", 0))
+        mine = await self.bot.stock_holdings.find_one(hkey(gid, ctx.author.id, ticker))
+        color = (discord.Color.green() if change > 0
+                 else discord.Color.red() if change < 0 else discord.Color.blurple())
+        e24 = make_embed("info", f"{ticker} — {st['name']}",
+            fields=[("💵 Цена", f"`{fmt_price(price)}`", True),
+                    ("📊 За 24ч", f"`{change:+.2f}%`", True),
+                    ("🏛️ Капитализация", f"`{fmt(cap)}`", True),
+                    ("👤 Владелец", f"<@{int(st['owner_id'])}>", True),
+                    ("📦 Всего акций", f"`{fmt(st.get('supply', 0))}`", True),
+                    ("🧾 У тебя", f"`{fmt((mine or {}).get('shares', 0))}`", True)],
+            footer=f"Сервер: {ctx.guild.name}")
+        e24.title = f"{'📈' if change >= 0 else '📉'} {ticker} — {st['name']}"
+        e24.color = color
+        cutoff = now() - timedelta(hours=24)
+        first = next((i for i, r in enumerate(rows) if r["created_at"] >= cutoff), len(rows) - 1)
+        day = rows[max(0, first - 1):]
+        files = []
+        try:
+            buf24, buf_all = io.BytesIO(), io.BytesIO()
+            async with self.bot.chart_lock:
+                await asyncio.to_thread(EconomyBot._render_chart, day[-1500:], buf24, "price", 2, "%H:%M")
+                await asyncio.to_thread(EconomyBot._render_chart, rows[-2500:], buf_all, "price", 2, "%d.%m")
+            buf24.seek(0); buf_all.seek(0)
+            files = [discord.File(buf24, filename="stock_24h.png"),
+                     discord.File(buf_all, filename="stock_all.png")]
+        except Exception:
+            log.exception("Stock chart render failed %s", ticker)
+        if not files:
+            return await safe_send(ctx, embed=e24)
+        e24.set_image(url="attachment://stock_24h.png")
+        eall = discord.Embed(title=f"{ticker} — вся история", color=color)
+        eall.set_image(url="attachment://stock_all.png")
+        await safe_send(ctx, embeds=[e24, eall], files=files)
+
+
+# =============================================================================
 # ИИ (управляется из панели /settings)
 # =============================================================================
 async def guild_ai_enabled(bot, guild_id: int) -> bool:
@@ -2320,7 +2760,8 @@ def settings_embed(guild, cfg):
     # Модули
     mods = cfg.get("modules", {})
     mod_lines = []
-    for key, label in [("business", "💼 Бизнес"), ("casino", "🎰 Казино"), ("crime", "🥷 Криминал")]:
+    for key, label in [("business", "💼 Бизнес"), ("casino", "🎰 Казино"), ("crime", "🥷 Криминал"),
+                       ("stocks", "📈 Биржа"), ("daily", "🎁 Ежедневный бонус")]:
         state = "✅ Вкл" if mods.get(key, True) else "❌ Выкл"
         mod_lines.append(f"{label}: {state}")
     embed.add_field(name="🧩 Модули", value="\n".join(mod_lines), inline=False)
@@ -2443,7 +2884,9 @@ class SettingsView(discord.ui.View):
         mods = cfg.get("modules", {})
         for module, label, emoji in [("business", "Бизнес", "💼"),
                                       ("casino", "Казино", "🎰"),
-                                      ("crime", "Криминал", "🥷")]:
+                                      ("crime", "Криминал", "🥷"),
+                                      ("stocks", "Биржа", "📈"),
+                                      ("daily", "Бонус", "🎁")]:
             btn = ModuleToggleButton(module, label, emoji)
             btn.style = discord.ButtonStyle.success if mods.get(module, True) else discord.ButtonStyle.secondary
             self.add_item(btn)
