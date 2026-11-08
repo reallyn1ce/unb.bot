@@ -3176,6 +3176,157 @@ class CasinoCog(commands.Cog):
             if not handed_off:
                 self.active_bj.discard(key)
 
+
+# =============================================================================
+# БИРЖА: вспомогательные функции и кнопки
+# =============================================================================
+def stock_sid(guild_id, ticker) -> str:
+    return f"{int(guild_id)}:{ticker}"
+
+def hkey(guild_id, user_id, ticker) -> dict:
+    return {"guild_id": int(guild_id), "user_id": int(user_id), "ticker": ticker}
+
+def fmt_price(value) -> str:
+    return f"{float(value):,.2f}".replace(",", " ")
+
+def stock_rows(st) -> list:
+    """История цены акции -> [{'created_at': datetime(UTC), 'price': float}, ...]."""
+    prices = st.get("history") or []
+    stamps = st.get("history_ts") or []
+    rows = []
+    for p, ts in zip(prices, stamps):
+        ts = as_utc(ts)
+        if ts is not None:
+            rows.append({"created_at": ts, "price": float(p)})
+    cur = float(st.get("price", 0) or 0)
+    # сделки меняют цену без записи в историю — добавляем текущую точку на график
+    if cur > 0 and (not rows or abs(rows[-1]["price"] - cur) > 1e-9):
+        rows.append({"created_at": as_utc(st.get("updated_at")) or now(), "price": cur})
+    if not rows:
+        rows.append({"created_at": as_utc(st.get("created_at")) or now(), "price": cur or STOCK_START_PRICE})
+    return rows
+
+def stock_change_24h(rows, price) -> float:
+    """Изменение цены за 24 часа в процентах."""
+    if not rows:
+        return 0.0
+    cutoff = now() - timedelta(hours=24)
+    base = rows[0]["price"]
+    for r in rows:
+        if r["created_at"] <= cutoff:
+            base = r["price"]
+        else:
+            break
+    return (float(price) / base - 1) * 100 if base > 0 else 0.0
+
+def fit_lines(lines, empty: str, limit: int = 1000) -> str:
+    """Склеивает строки в значение поля эмбеда (лимит Discord — 1024 символа)."""
+    if not lines:
+        return empty
+    out, used = [], 0
+    for i, line in enumerate(lines):
+        extra = len(line) + 1
+        if used + extra > limit - 25:
+            out.append(f"… и ещё {len(lines) - i}")
+            break
+        out.append(line)
+        used += extra
+    return "\n".join(out)
+
+
+class StockTickerButton(discord.ui.Button):
+    def __init__(self, ticker: str):
+        super().__init__(label=ticker, style=discord.ButtonStyle.secondary, emoji="📈")
+        self.ticker = ticker
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "StockListView" = self.view
+        if interaction.guild_id != view.guild_id:
+            return await reply_ephemeral(interaction, "❌ Эта кнопка относится к другому серверу.")
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            payload = await view.cog._build_info(view.guild_id, interaction.user.id,
+                                                 interaction.guild.name, self.ticker)
+            if payload is None:
+                return await interaction.followup.send(f"❌ Акция `{self.ticker}` больше не существует.",
+                                                       ephemeral=True)
+            embeds, files = payload
+            kwargs = {"files": files} if files else {}
+            await interaction.followup.send(embeds=embeds, ephemeral=True, **kwargs)
+        except Exception:
+            log.exception("Stock button failed %s", self.ticker)
+
+
+class StockListView(discord.ui.View):
+    def __init__(self, cog, guild_id: int, tickers):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild_id = int(guild_id)
+        self.message = None
+        for t in list(tickers)[:STOCK_LIST_BUTTONS]:
+            self.add_item(StockTickerButton(t))
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            try: await self.message.edit(view=self)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException): pass
+
+
+# =============================================================================
+# БИРЖА
+# =============================================================================
+class StockCog(commands.Cog):
+    def __init__(self, bot: EconomyBot):
+        self.bot = bot
+        self._last_trade = {}      # (guild_id, user_id) -> monotonic время последней сделки
+
+    async def _require_module(self, ctx) -> bool:
+        if await self.bot.module_enabled(ctx.guild.id, "stocks"):
+            return True
+        await send_embed(ctx, "warning", "📈 Биржа отключена",
+                         "Администратор сервера выключил этот модуль. "
+                         "Включить можно через `/settings`.")
+        return False
+
+    def _throttle(self, gid: int, uid: int) -> float:
+        """0 — сделка разрешена (и время зафиксировано); иначе секунд до следующей."""
+        t, key = time.monotonic(), (int(gid), int(uid))
+        if len(self._last_trade) > 5000:
+            self._last_trade = {k: v for k, v in self._last_trade.items()
+                                if t - v < STOCK_TRADE_COOLDOWN}
+        left = STOCK_TRADE_COOLDOWN - (t - self._last_trade.get(key, -1e9))
+        if left > 0:
+            return left
+        self._last_trade[key] = t
+        return 0
+
+    @staticmethod
+    def _parse_ticker(raw) -> str:
+        return "".join(str(raw or "").split()).upper()
+
+    @staticmethod
+    def _looks_like_ticker(raw) -> bool:
+        raw = str(raw or "").strip()
+        return raw == raw.upper() and bool(STOCK_TICKER_RE.match(raw))
+
+    @staticmethod
+    def _auto_ticker_base(name: str) -> str:
+        return re.sub(r"[^A-ZА-ЯЁ0-9]", "", str(name).upper())[:STOCK_AUTO_TICKER_LEN]
+
+    async def _free_ticker(self, gid: int, base: str, session=None):
+        cands = [base]
+        for n in range(2, 100):
+            s = str(n)
+            cands.append(base[:6 - len(s)] + s)
+        taken = {d["ticker"] async for d in self.bot.stocks.find(
+            {"guild_id": int(gid), "ticker": {"$in": cands}}, {"ticker": 1}, session=session)}
+        return next((c for c in cands if c not in taken), None)
+
+    async def _get_stock(self, gid: int, ticker: str):
+        return await self.bot.stocks.find_one({"_id": stock_sid(gid, ticker), "guild_id": int(gid)})
+
     # ---------- группа ----------
     @commands.hybrid_group(name="stock", aliases=["stocks"], description="Биржа", invoke_without_command=True)
     async def stock(self, ctx):
