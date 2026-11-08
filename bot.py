@@ -8,6 +8,7 @@ import urllib.parse
 import random
 import re
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 import aiohttp
@@ -23,7 +24,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import FuncFormatter
 
-BOT_VERSION = "7.4.0"
+BOT_VERSION = "7.5.0"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_USER = os.getenv("MONGO_USER")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
@@ -59,6 +60,17 @@ BUSINESS_MAX_LEVEL = 10
 CASINO_MIN_BET = 10
 CASINO_MAX_BET = 100_000
 SLOT_SYMBOLS = ["🍒", "🍋", "🍇", "💎", "7️⃣"]
+# Множители слотов по числу совпавших линий (3+ линий — одна ступень).
+# Сетка 3x3, 5 символов, 8 линий. Точное распределение (5^9 исходов):
+#   0 линий 71.86% | 1 линия 24.78% | 2 линии 2.94% | 3+ линий 0.40%
+# RTP = 0.24781*3 + 0.02943*4 + 0.00415*10 ≈ 90.3%  (было ×2/×4/×10 ≈ 65.5%)
+SLOT_PAYOUTS = {1: 3, 2: 4, 3: 10}
+SLOT_MAX_MULT = max(SLOT_PAYOUTS.values())
+
+def slot_multiplier(line_count: int) -> int:
+    if line_count <= 0:
+        return 0
+    return SLOT_PAYOUTS[min(line_count, 3)]
 PLAY_AGAIN_TIMEOUT = 120
 COIN_EMOJI = "🪙"
 BJ_TIMEOUT = 90
@@ -396,45 +408,111 @@ class AIError(Exception): pass
 class AIHandler:
     REPORT_PROMPT = ("Ты — финансовый аналитик. Проанализируй эти данные экономики "
                      "и напиши краткий отчет (3-4 предложения) о состоянии рынка.")
+    # Запасные модели Groq, если выбранная снята с обслуживания (Groq отвечает 404/400 model_not_found)
+    FALLBACK_MODELS = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-8b-instant"]
+    MODEL_ERROR_CODES = {"model_not_found", "model_decommissioned", "model_not_active",
+                         "model_terms_required"}
+
     def __init__(self):
         self.api_key = os.getenv("AI_API_KEY") or os.getenv("GROQ_API_KEY")
-        self.url = os.getenv("AI_URL", DEFAULT_AI_URL)
-        model = os.getenv("AI_MODEL") or os.getenv("GROQ_MODEL", DEFAULT_AI_MODEL)
+        self.url = self._normalize_url(os.getenv("AI_URL"))
+        model = (os.getenv("AI_MODEL") or os.getenv("GROQ_MODEL") or DEFAULT_AI_MODEL).strip()
         self.model = LEGACY_MODEL_ALIASES.get(model, model)
         self._session = None
 
+    @staticmethod
+    def _normalize_url(url) -> str:
+        """Чиним типичные ошибки в AI_URL: пустая строка, база без /chat/completions."""
+        url = (url or "").strip().rstrip("/")
+        if not url:
+            return DEFAULT_AI_URL
+        if url.endswith("/chat/completions"):
+            return url
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path.rstrip("/")
+        if parsed.netloc.endswith("groq.com"):
+            if path in ("", "/openai", "/openai/v1", "/v1"):
+                return f"{parsed.scheme}://{parsed.netloc}/openai/v1/chat/completions"
+        elif path in ("", "/v1"):
+            return f"{url.rstrip('/')}{'' if path else '/v1'}/chat/completions"
+        return url
+
     @property
     def enabled(self): return bool(self.api_key)
+
+    @property
+    def is_groq(self) -> bool:
+        return "groq.com" in urllib.parse.urlparse(self.url).netloc
 
     async def _http(self):
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         return self._session
 
+    @staticmethod
+    def _error_info(body: str):
+        """(code, message) из тела ошибки в формате OpenAI/Groq."""
+        try:
+            err = json.loads(body).get("error")
+        except (ValueError, AttributeError):
+            return "", ""
+        if isinstance(err, dict):
+            return str(err.get("code") or err.get("type") or ""), str(err.get("message") or "")
+        return "", str(err or "")
+
+    def _model_candidates(self):
+        models = [self.model]
+        if self.is_groq:
+            models += [m for m in self.FALLBACK_MODELS if m not in models]
+        return models
+
     async def complete(self, system, user, *, max_tokens=400):
         if not self.enabled: raise AIError("Не задан AI_API_KEY / GROQ_API_KEY.")
-        payload = {"model": self.model, "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}],
-            "temperature": 0.4, "max_tokens": max_tokens}
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        try:
-            session = await self._http()
-            async with session.post(self.url, json=payload, headers=headers) as resp:
-                body = await resp.text()
-                if resp.status != 200:
-                    log.error("AI HTTP %s: %s", resp.status, body[:500])
-                    raise AIError(f"ИИ-сервис вернул ошибку HTTP {resp.status}.")
-                data = json.loads(body)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            log.exception("AI недоступен")
-            raise AIError("Не удалось связаться с ИИ-сервисом.")
-        except json.JSONDecodeError:
-            raise AIError("ИИ-сервис вернул некорректный ответ.")
-        try:
-            return data["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError, AttributeError):
-            raise AIError("ИИ-сервис вернул пустой ответ.")
+        model_failed = False
+        for model in self._model_candidates():
+            payload = {"model": model, "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user}],
+                "temperature": 0.4, "max_tokens": max_tokens}
+            try:
+                session = await self._http()
+                async with session.post(self.url, json=payload, headers=headers) as resp:
+                    body = await resp.text()
+                    status = resp.status
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                log.exception("AI недоступен")
+                raise AIError("Не удалось связаться с ИИ-сервисом.")
+            if status == 200:
+                if model != self.model:
+                    log.warning("AI: модель %s недоступна, переключаюсь на %s", self.model, model)
+                    self.model = model
+                try:
+                    data = json.loads(body)
+                except json.JSONDecodeError:
+                    raise AIError("ИИ-сервис вернул некорректный ответ.")
+                try:
+                    return data["choices"][0]["message"]["content"].strip()
+                except (KeyError, IndexError, AttributeError):
+                    raise AIError("ИИ-сервис вернул пустой ответ.")
+            code, message = self._error_info(body)
+            log.error("AI HTTP %s (url=%s model=%s): %s", status, self.url, model, body[:500])
+            blob = f"{code} {message}".lower()
+            is_model_error = code in self.MODEL_ERROR_CODES or (
+                status in (400, 404) and "model" in blob)
+            if is_model_error:
+                model_failed = True
+                continue                      # пробуем следующую модель
+            if status == 404:
+                raise AIError("ИИ-эндпоинт не найден (HTTP 404). Проверь `AI_URL`.")
+            if status in (401, 403):
+                raise AIError("ИИ-сервис отклонил ключ API. Проверь `AI_API_KEY`.")
+            if status == 429:
+                raise AIError("Лимит запросов к ИИ исчерпан. Попробуй позже.")
+            raise AIError(f"ИИ-сервис вернул ошибку HTTP {status}.")
+        if model_failed:
+            raise AIError("Модель недоступна. Администратору: проверь `AI_MODEL` / `GROQ_MODEL`.")
+        raise AIError("ИИ-сервис недоступен.")
 
     async def market_report(self, stats):
         data = json.dumps(stats, ensure_ascii=False)
@@ -475,8 +553,10 @@ class EconomyBot(commands.Bot):
         self.casino_stats = None
         self.stocks = None
         self.stock_holdings = None
+        self.active_games = None
         self.ai = AIHandler()
         self._settings_cache = {}
+        self._infl_cache = {}
         self.add_check(guild_only_check)
         self.chart_lock = asyncio.Lock()
         self._web_runner = None
@@ -519,6 +599,7 @@ class EconomyBot(commands.Bot):
         self.casino_stats = self.db.casino_stats
         self.stocks = self.db.stocks
         self.stock_holdings = self.db.stock_holdings
+        self.active_games = self.db.active_games
 
         await self.migrate_legacy()
         await self.migrate_stock_isolation()
@@ -536,6 +617,7 @@ class EconomyBot(commands.Bot):
         await safe_create_index(self.stocks, [("guild_id", 1), ("ticker", 1)])
         await safe_create_index(self.stock_holdings, [("guild_id", 1), ("user_id", 1), ("ticker", 1)],
                                 unique=True, drop_on_conflict=True)
+        await safe_create_index(self.active_games, [("guild_id", 1), ("user_id", 1)])
         await safe_create_index(self.economy, "_id")
         await safe_create_index(self.funds, "_id")
 
@@ -544,12 +626,17 @@ class EconomyBot(commands.Bot):
             await self.ensure_guild_funds(guild.id)
 
         await self.add_cog(EconomyCog(self))
-        await self.add_cog(CasinoCog(self))
+        casino = CasinoCog(self)
+        await self.add_cog(casino)
+        # Рестарт во время игры: возвращаем ставки всех незавершённых партий
+        await casino.recover_active_games()
         await self.add_cog(StockCog(self))
         await self.add_cog(SettingsCog(self))
 
         if not self.ai.enabled:
             log.info("GROQ_API_KEY не задан — ИИ отключён.")
+        else:
+            log.info("ИИ: url=%s model=%s", self.ai.url, self.ai.model)
         try:
             synced = await self.tree.sync()
             log.info("Slash sync: %s", len(synced))
@@ -879,6 +966,7 @@ class EconomyBot(commands.Bot):
             await self.journal("money_printing", "economy", gross, f"Эмиссия: {reason}",
                                {"type": "earning_emission", "tax": tax},
                                session=session, guild_id=guild_id)
+            self.invalidate_inflation(guild_id)
 
     async def pay_earning(self, guild_id, user_id, gross, reason, *, tax_rate,
                           account="cash", session=None):
@@ -923,31 +1011,64 @@ class EconomyBot(commands.Bot):
         ]).to_list(1)
         printed = int((await self.economy.find_one({"_id": self.cb_id(gid)}) or {}).get("printed", 0))
         supply = reserve + players + budget
+        printed_24h, burned_24h = await self.emission_24h(gid)
         return {
             "reserve": reserve, "budget": budget,
             "players": players, "player_debt": player_debt,
             "circulation": players + budget,
             "debt": max(0, -reserve), "supply": supply,
             "printed": printed,
-            "inflation": self.calc_inflation(printed, supply),
+            "printed_24h": printed_24h, "burned_24h": burned_24h,
+            "inflation": self.calc_inflation(printed_24h - burned_24h, supply),
             "incoming": int(incoming[0]["n"]) if incoming else 0,
             "outgoing": int(outgoing[0]["n"]) if outgoing else 0,
         }
 
     @staticmethod
-    def calc_inflation(printed, supply) -> float:
-        """inflation = max(0, (printed / (reserve + players + budget) - 1) * 100)."""
-        if supply <= 0:
+    def calc_inflation(net_emission_24h, supply) -> float:
+        """Инфляция, % = чистая эмиссия за 24ч / денежная масса * 100.
+
+        net_emission_24h = напечатано за 24ч (print-money, заработок, доход бизнеса)
+                           минус сожжено за 24ч (burn-money).
+        Знаменатель не меньше самой эмиссии, поэтому значение ограничено 100%
+        и нет деления на ноль при пустой/отрицательной денежной массе.
+        Дефляции нет: при чистом сжигании инфляция просто падает до 0.
+        """
+        net = int(net_emission_24h)
+        if net <= 0:
             return 0.0
-        return max(0.0, (printed / supply - 1.0) * 100)
+        denom = max(int(supply), net, 1)
+        return net / denom * 100.0
+
+    INFLATION_CACHE_TTL = 10  # секунд
+
+    async def emission_24h(self, guild_id):
+        """(напечатано, сожжено) за последние 24 часа по журналу транзакций сервера."""
+        since = now() - timedelta(hours=24)
+        rows = await self.tx.aggregate([
+            {"$match": {"guild_id": int(guild_id), "created_at": {"$gte": since},
+                        "$or": [{"source": "money_printing"}, {"destination": "money_burn"}]}},
+            {"$group": {"_id": None,
+                        "printed": {"$sum": {"$cond": [{"$eq": ["$source", "money_printing"]}, "$amount", 0]}},
+                        "burned": {"$sum": {"$cond": [{"$eq": ["$destination", "money_burn"]}, "$amount", 0]}}}},
+        ]).to_list(1)
+        if not rows:
+            return 0, 0
+        return int(rows[0].get("printed", 0)), int(rows[0].get("burned", 0))
+
+    def invalidate_inflation(self, guild_id):
+        self._infl_cache.pop(int(guild_id), None)
 
     @staticmethod
     def inflation_factor(inflation, multiplier) -> float:
         return max(0.0, 1.0 - float(inflation) * 0.01 * float(multiplier))
 
     async def current_inflation(self, guild_id) -> float:
-        """Лёгкий расчёт инфляции (без 24ч-агрегаций по журналу транзакций)."""
+        """Инфляция сервера (кэш 10 с; сбрасывается при print/burn/заработке)."""
         gid = int(guild_id)
+        cached = self._infl_cache.get(gid)
+        if cached and time.monotonic() - cached[0] < self.INFLATION_CACHE_TTL:
+            return cached[1]
         reserve = await self.reserve(gid)
         budget = await self.fund_balance(gid)
         rows = await self.db_users.aggregate([
@@ -956,8 +1077,10 @@ class EconomyBot(commands.Bot):
         ]).to_list(1)
         p = rows[0] if rows else {}
         players = int(p.get("cash", 0)) + int(p.get("bank", 0))
-        printed = int((await self.economy.find_one({"_id": self.cb_id(gid)}) or {}).get("printed", 0))
-        return self.calc_inflation(printed, reserve + players + budget)
+        printed_24h, burned_24h = await self.emission_24h(gid)
+        value = self.calc_inflation(printed_24h - burned_24h, reserve + players + budget)
+        self._infl_cache[gid] = (time.monotonic(), value)
+        return value
 
     async def snapshot(self):
         """Делаем снапшоты по всем серверам."""
@@ -1268,6 +1391,8 @@ class EconomyCog(commands.Cog):
 
     @commands.hybrid_command(name="help", aliases=["h"], description="Команды экономики")
     async def help_command(self, ctx):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         await send_embed(ctx, "info", "Справка по экономике",
             description="**Баланс у каждого сервера свой — своя инфляция, свой ЦБ.**",
             fields=[
@@ -1314,6 +1439,8 @@ class EconomyCog(commands.Cog):
     @commands.hybrid_command(name="pay", aliases=["p"], description="Перевести наличные игроку")
     @app_commands.describe(member="Кому", amount="Сумма")
     async def pay(self, ctx, member: discord.Member, amount: int):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if member.bot:
             return await send_embed(ctx, "danger", "Ошибка", "Нельзя переводить ботам.")
         ok, message = await self.bot.transfer_players(ctx.guild.id, ctx.author.id, member.id, amount)
@@ -1539,8 +1666,9 @@ class EconomyCog(commands.Cog):
     @commands.hybrid_command(name="set-cooldown", with_app_command=False, description="Кулдаун команды (админ)")
     @commands.has_permissions(administrator=True)
     @commands.guild_only()
-    @app_commands.describe(command="work/crime/slut/daily/rob", seconds="Кулдаун в секундах")
     async def setcooldown(self, ctx, command: Literal["work", "crime", "slut", "daily", "rob"], seconds: int):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if seconds < 0 or seconds > COOLDOWN_MAX:
             return await send_embed(ctx, "danger", "Ошибка",
                                     f"Кулдаун должен быть от 0 до {fmt(COOLDOWN_MAX)} секунд.")
@@ -1594,6 +1722,8 @@ class EconomyCog(commands.Cog):
 
     @commands.hybrid_command(name="top", aliases=["t"], description="Топ-10 игроков")
     async def top(self, ctx):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         rows = await self.bot.db_users.aggregate([
             {"$match": {"guild_id": ctx.guild.id}},
             {"$addFields": {"net": {"$subtract": [
@@ -1640,6 +1770,8 @@ class EconomyCog(commands.Cog):
 
     @business.command(name="buy", description="Купить бизнес")
     async def business_buy(self, ctx):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if not await self._require_module(ctx, "business", "Бизнес"): return
         gid, uid = ctx.guild.id, ctx.author.id
         user = await self.bot.ensure_user(gid, uid)
@@ -1687,6 +1819,8 @@ class EconomyCog(commands.Cog):
 
     @business.command(name="upgrade", description="Улучшить бизнес")
     async def business_upgrade(self, ctx):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if not await self._require_module(ctx, "business", "Бизнес"): return
         gid, uid = ctx.guild.id, ctx.author.id
         await self.bot.ensure_user(gid, uid)
@@ -1726,6 +1860,8 @@ class EconomyCog(commands.Cog):
     # ---------- КРЕДИТЫ ----------
     @commands.hybrid_group(name="loan", aliases=["ln"], description="Кредиты", invoke_without_command=True)
     async def loan(self, ctx):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         gid = ctx.guild.id
         data = await self.bot.get_balance(gid, ctx.author.id)
         cfg = await self.bot.get_settings(gid)
@@ -1746,6 +1882,8 @@ class EconomyCog(commands.Cog):
     @loan.command(name="take", description="Взять кредит")
     @app_commands.describe(amount="Сумма")
     async def loan_take(self, ctx, amount: int):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if amount < LOAN_MIN or amount > LOAN_MAX:
             return await send_embed(ctx, "danger", "Ошибка",
                 f"Сумма должна быть от {fmt(LOAN_MIN)} до {fmt(LOAN_MAX)}.")
@@ -1792,6 +1930,8 @@ class EconomyCog(commands.Cog):
     @loan.command(name="pay", description="Погасить кредит")
     @app_commands.describe(amount="Сумма")
     async def loan_pay(self, ctx, amount: int):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if amount <= 0:
             return await send_embed(ctx, "danger", "Ошибка", "Сумма должна быть положительной.")
         gid, uid = ctx.guild.id, ctx.author.id
@@ -1828,6 +1968,8 @@ class EconomyCog(commands.Cog):
     # ---------- ЦБ и экономика СЕРВЕРА ----------
     @commands.hybrid_command(name="cb", description="Центральный банк сервера")
     async def cb(self, ctx):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         s = await self.bot.stats(ctx.guild.id)
         extra = await self._inflation_fields(ctx.guild.id, s)
         await send_embed(ctx, "info", f"🏦 ЦБ — {ctx.guild.name}",
@@ -1844,6 +1986,8 @@ class EconomyCog(commands.Cog):
 
     @commands.hybrid_command(name="economy", description="Статистика сервера")
     async def economy(self, ctx):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         s = await self.bot.stats(ctx.guild.id)
         extra = await self._inflation_fields(ctx.guild.id, s)
         await send_embed(ctx, "info", f"📈 Экономика — {ctx.guild.name}",
@@ -1860,6 +2004,8 @@ class EconomyCog(commands.Cog):
     @commands.hybrid_command(name="print-money", with_app_command=False, description="Эмиссия в резерв ЦБ сервера")
     @commands.has_permissions(administrator=True)
     async def print_money(self, ctx, amount: int):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if amount <= 0:
             return await send_embed(ctx, "danger", "Ошибка", "Сумма должна быть положительной.")
         await self.bot.ensure_guild_funds(ctx.guild.id)
@@ -1871,6 +2017,7 @@ class EconomyCog(commands.Cog):
                     {"$inc": {"printed": amount}}, session=session)
                 await self.bot.journal("money_printing", "central_bank", amount,
                                        "Эмиссия", session=session, guild_id=ctx.guild.id)
+        self.bot.invalidate_inflation(ctx.guild.id)
         await send_embed(ctx, "success", "🖨️ Эмиссия проведена",
             fields=[
                 ("💸 Напечатано", f"`{fmt(amount)}`", True),
@@ -1881,6 +2028,8 @@ class EconomyCog(commands.Cog):
     @commands.hybrid_command(name="burn-money", with_app_command=False, description="Сжечь средства из резерва ЦБ сервера")
     @commands.has_permissions(administrator=True)
     async def burn_money(self, ctx, amount: int):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if amount <= 0:
             return await send_embed(ctx, "danger", "Ошибка", "Сумма должна быть положительной.")
         try:
@@ -1892,14 +2041,16 @@ class EconomyCog(commands.Cog):
                                            "Сжигание денег", session=session, guild_id=ctx.guild.id)
         except EconomyError as e:
             return await send_embed(ctx, "danger", "Ошибка", str(e))
+        self.bot.invalidate_inflation(ctx.guild.id)
         await send_embed(ctx, "success", "🔥 Деньги сожжены",
             fields=[("💸 Сожжено", f"`{fmt(amount)}`", True),
                     ("💎 Новый резерв", f"`{fmt(await self.bot.reserve(ctx.guild.id))}`", True)])
 
     @commands.hybrid_command(name="set-report-channel", with_app_command=False, description="Канал ежедневных отчётов")
     @commands.has_permissions(administrator=True)
-    @app_commands.describe(channel="Канал (по умолчанию текущий)")
     async def setreportchannel(self, ctx, channel: discord.TextChannel = None):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         channel = channel or ctx.channel
         await self.bot.settings.update_one(
             {"_id": ctx.guild.id},
@@ -1909,8 +2060,9 @@ class EconomyCog(commands.Cog):
 
     @commands.hybrid_command(name="set-chart-channel", with_app_command=False, description="Канал автоматических графиков")
     @commands.has_permissions(administrator=True)
-    @app_commands.describe(channel="Канал (по умолчанию текущий)")
     async def setchartchannel(self, ctx, channel: discord.TextChannel = None):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         channel = channel or ctx.channel
         await self.bot.settings.update_one(
             {"_id": ctx.guild.id},
@@ -1921,6 +2073,8 @@ class EconomyCog(commands.Cog):
     @commands.hybrid_command(name="graphs", aliases=["chart"], with_app_command=False, description="Графики экономики сервера")
     @commands.has_permissions(administrator=True)
     async def graphs(self, ctx):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         await ctx.defer()
         await self.bot.snapshot()
         delivered = await self.bot.publish_charts(ctx.guild.id, channel=ctx.channel)
@@ -1951,7 +2105,7 @@ def fmt_cards(cards, hide_second=False):
     return " ".join(f"`{c}`" for c in cards) + f" = {hand_value(cards)}"
 
 PAYTABLES = {
-    "slot": "🎰 **Выплаты слотов 3×3**\nСовпавшие символы на линии (ряд, столбец или диагональ):\n• 1 линия — ×2\n• 2 линии — ×4\n• 3+ линий — ×10\nИначе — 0",
+    "slot": "🎰 **Выплаты слотов 3×3**\nСовпавшие символы на линии (ряд, столбец или диагональ):\n• 1 линия — ×3\n• 2 линии — ×4\n• 3+ линий — ×10\nИначе — 0\nТеоретический возврат (RTP) ≈ 90%",
     "rr": "🔫 **Русская рулетка**\nШанс пули — 1 из 6 на каждый выстрел. Пусто — множитель растёт (×1.18, ×1.41, ×1.69…), пуля — ставка потеряна. «Забрать» — получить ставку × текущий множитель.",
     "blackjack": "🃏 **Блэкджек**\nНабери 21. Дилер берёт до 17.\nПобеда — ×2, ничья — возврат.",
 }
@@ -2077,6 +2231,17 @@ class BlackjackView(CasinoView):
         self.player = [draw_card(), draw_card()]
         self.dealer = [draw_card(), draw_card()]
         self.done = False
+        self.stake_id = None            # запись в active_games для текущего раунда
+
+    async def on_timeout(self):
+        """Игрок пропал посреди раунда: авто-«Хватит», иначе ключ в active_bj залипнет навсегда."""
+        async with self.lock:
+            if self.done:
+                for child in self.children:
+                    child.disabled = True
+                await self._show(None)
+                return
+            await self._finish(None, "stand", offer_again=False)
 
     def render(self, result=None, color=None):
         embed = discord.Embed(
@@ -2120,9 +2285,14 @@ class BlackjackView(CasinoView):
                 payout, text, color = self.bet, "🤝 Ничья — ставка возвращена.", discord.Color.light_grey()
             else:
                 payout, text, color = 0, "❌ Дилер победил. Ставка проиграна.", discord.Color.red()
+        if payout <= 0:
+            await self.cog.close_stakes([self.stake_id])
+            self.stake_id = None
         if payout > 0:
             try:
-                await self.cog.settle_payout(self.guild_id, self.user_id, payout, "blackjack")
+                await self.cog.settle_payout(self.guild_id, self.user_id, payout, "blackjack",
+                                             stake_id=self.stake_id)
+                self.stake_id = None
                 text += f"\nВыплата: **{fmt(payout)}**."
             except Exception:
                 log.warning("Не удалось выплатить blackjack guild=%s uid=%s payout=%s",
@@ -2170,8 +2340,9 @@ class BlackjackView(CasinoView):
                 await self.cog.precheck(self.guild_id, self.user_id, self.bet)
                 async with await self.cog.bot.mongo.start_session() as session:
                     async with session.start_transaction():
-                        await self.cog.take_bet(self.guild_id, self.user_id, self.bet, "blackjack",
-                                                max_payout=self.bet * 2, session=session)
+                        self.stake_id = await self.cog.take_bet(
+                            self.guild_id, self.user_id, self.bet, "blackjack",
+                            max_payout=self.bet * 2, session=session, track=True)
             except EconomyError as e:
                 self.cog.active_bj.discard(self.key)
                 return await reply_ephemeral(interaction, f"❌ {e}")
@@ -2205,10 +2376,11 @@ def rr_multiplier(steps: int) -> float:
 
 
 class RRPlayer:
-    __slots__ = ("uid", "name", "bet", "steps", "status", "paid")
+    __slots__ = ("uid", "name", "bet", "steps", "status", "paid", "stake_id")
 
-    def __init__(self, uid: int, name: str, bet: int):
+    def __init__(self, uid: int, name: str, bet: int, stake_id=None):
         self.uid, self.name, self.bet = int(uid), name, int(bet)
+        self.stake_id = stake_id
         self.steps = 0
         self.status = "active"      # active | dead | cashed | won
         self.paid = 0
@@ -2225,6 +2397,8 @@ class RRModeView(discord.ui.View):
         self.cog, self.host, self.guild_id, self.bet = cog, host, int(guild_id), int(bet)
         self.message = None
         self.chosen = False
+        # Ключ (guild, host) уже занят в active_rr командой !rr ещё до первого await.
+        self.reserved = True
 
     async def interaction_check(self, interaction: discord.Interaction):
         if interaction.guild_id != self.guild_id:
@@ -2258,11 +2432,12 @@ class RRModeView(discord.ui.View):
         await interaction.response.defer()
         gid, uid = self.guild_id, self.host.id
         key = (gid, uid)
-        if key in self.cog.active_rr:
-            return await self._fail(interaction, "У тебя уже идёт игра в рулетку.")
-        self.cog.active_rr.add(key)
+        if not self.reserved:
+            if key in self.cog.active_rr:
+                return await self._fail(interaction, "У тебя уже идёт игра в рулетку.")
+            self.cog.active_rr.add(key)
         try:
-            await self.cog.rr_take_stake(gid, uid, self.bet)
+            stake_id = await self.cog.rr_take_stake(gid, uid, self.bet)
         except EconomyError as e:
             self.cog.active_rr.discard(key)
             return await self._fail(interaction, str(e))
@@ -2271,7 +2446,7 @@ class RRModeView(discord.ui.View):
             await self._fail(interaction, "Внутренняя ошибка. Попробуй ещё раз.")
             raise
         self.stop()
-        player = RRPlayer(uid, self.host.display_name, self.bet)
+        player = RRPlayer(uid, self.host.display_name, self.bet, stake_id)
         if multi:
             await self.cog.rr_run_lobby(self.message, gid, player)
         else:
@@ -2280,6 +2455,8 @@ class RRModeView(discord.ui.View):
     async def on_timeout(self):
         if self.chosen:
             return
+        if self.reserved:                      # режим не выбран, ставка не списывалась
+            self.cog.active_rr.discard((self.guild_id, self.host.id))
         for child in self.children:
             child.disabled = True
         if self.message is not None:
@@ -2328,14 +2505,14 @@ class RRLobbyView(discord.ui.View):
                 return await reply_ephemeral(interaction, "❌ У тебя уже идёт игра в рулетку.")
             self.cog.active_rr.add(key)
             try:
-                await self.cog.rr_take_stake(self.guild_id, user.id, self.bet)
+                stake_id = await self.cog.rr_take_stake(self.guild_id, user.id, self.bet)
             except EconomyError as e:
                 self.cog.active_rr.discard(key)
                 return await reply_ephemeral(interaction, f"❌ {e}")
             except Exception:
                 self.cog.active_rr.discard(key)
                 raise
-            self.players.append(RRPlayer(user.id, user.display_name, self.bet))
+            self.players.append(RRPlayer(user.id, user.display_name, self.bet, stake_id))
             embed = self.render()
         try:
             await interaction.edit_original_response(embed=embed, view=self)
@@ -2476,7 +2653,8 @@ class RRGameView(discord.ui.View):
             self.pot += p.bet
             self.log.append(f"⏰ **{p.name}** не ответил — выбывает, ставка уходит в банк проигравших.")
         else:
-            await self.cog.settle_payout(self.guild_id, p.uid, p.bet, "russian_roulette_refund")
+            await self.cog.settle_payout(self.guild_id, p.uid, p.bet, "russian_roulette_refund",
+                                         stake_id=p.stake_id)
             p.status, p.paid = "cashed", p.bet
             self.log.append(f"⏰ **{p.name}** не стрелял — ставка возвращена.")
         await self._after_action(None)
@@ -2506,7 +2684,7 @@ class RRGameView(discord.ui.View):
     # ---------- действия ----------
     async def _cash_out(self, p: RRPlayer):
         payout = p.payout
-        await self.cog.settle_payout(self.guild_id, p.uid, payout, RR_GAME)       # транзакция
+        await self.cog.settle_payout(self.guild_id, p.uid, payout, RR_GAME, stake_id=p.stake_id)  # транзакция
         p.status, p.paid = "cashed", payout
         self.log.append(f"💰 **{p.name}** забирает {COIN_EMOJI} `{fmt(payout)}` (x{rr_multiplier(p.steps):.2f}).")
 
@@ -2532,9 +2710,11 @@ class RRGameView(discord.ui.View):
         if self.multi and len(active) == 1:
             w = active[0]
             total = w.payout + self.pot
-            await self.cog.settle_payout(self.guild_id, w.uid, total, RR_GAME)    # транзакция
+            await self.cog.settle_payout(self.guild_id, w.uid, total, RR_GAME, stake_id=w.stake_id)  # транзакция
             w.status, w.paid = "won", total
             self.log.append(f"🏆 **{w.name}** — последний выживший! Забирает {COIN_EMOJI} `{fmt(total)}`.")
+        # Игра окончена: закрываем оставшиеся записи (проигравшие / банк уже распределён)
+        await self.cog.close_stakes([p.stake_id for p in self.players])
         self.ended = True
         self._cancel_timer()
         self._release()
@@ -2593,10 +2773,12 @@ class RRGameView(discord.ui.View):
             for p in self.players:
                 if p.status == "active":        # активным игрокам возвращаем ставку
                     try:
-                        await self.cog.settle_payout(self.guild_id, p.uid, p.bet, "russian_roulette_refund")
+                        await self.cog.settle_payout(self.guild_id, p.uid, p.bet, "russian_roulette_refund",
+                                                     stake_id=p.stake_id)
                         p.status, p.paid = "cashed", p.bet
                     except Exception:
                         log.exception("Не удалось вернуть ставку при аварии рулетки uid=%s", p.uid)
+            await self.cog.close_stakes([p.stake_id for p in self.players])
             self._release()
             for child in self.children:
                 child.disabled = True
@@ -2643,7 +2825,10 @@ class CasinoCog(commands.Cog):
         if cash < bet:
             raise EconomyError(f"Недостаточно наличных: у тебя `{fmt(cash)}`, ставка `{fmt(bet)}`.")
 
-    async def take_bet(self, gid: int, uid: int, bet: int, game: str, *, max_payout: int, session):
+    async def take_bet(self, gid: int, uid: int, bet: int, game: str, *, max_payout: int, session,
+                       track: bool = False):
+        """Списывает ставку. track=True — пишет запись в active_games В ТОЙ ЖЕ транзакции
+        (для многошаговых игр: bj, rr) и возвращает её id; slot завершается в одной транзакции."""
         debit = await self.bot.db_users.update_one(
             {**ukey(gid, uid), "cash": {"$gte": bet}},
             {"$inc": {"cash": -bet}, "$set": {"updated_at": now()}},
@@ -2664,6 +2849,13 @@ class CasinoCog(commands.Cog):
         )
         await self.bot.journal(f"user_{uid}", "central_bank", bet, f"Казино: ставка ({game})",
                                {"game": game}, session=session, guild_id=gid)
+        if not track:
+            return None
+        stake_id = uuid.uuid4().hex
+        await self.bot.active_games.insert_one(
+            {"_id": stake_id, "guild_id": int(gid), "user_id": int(uid), "game": key,
+             "bet": int(bet), "created_at": now()}, session=session)
+        return stake_id
 
     async def pay_out(self, gid: int, uid: int, payout: int, game: str, *, session, force=False):
         if payout <= 0:
@@ -2680,10 +2872,46 @@ class CasinoCog(commands.Cog):
         await self.bot.journal("central_bank", f"user_{uid}", payout, f"Казино: выплата ({game})",
                                {"game": game}, session=session, guild_id=gid)
 
-    async def settle_payout(self, gid: int, uid: int, payout: int, game: str):
+    async def settle_payout(self, gid: int, uid: int, payout: int, game: str, *, stake_id=None):
+        """Выплата + закрытие записи ставки (stake_id) в одной транзакции."""
         async with await self.bot.mongo.start_session() as session:
             async with session.start_transaction():
+                if stake_id:
+                    await self.bot.active_games.delete_one({"_id": stake_id}, session=session)
                 await self.pay_out(gid, uid, payout, game, session=session, force=True)
+
+    async def close_stakes(self, stake_ids):
+        """Закрывает записи ставок без выплаты (проигрыш / игра окончена). Идемпотентно."""
+        ids = [i for i in stake_ids if i]
+        if not ids:
+            return
+        try:
+            await self.bot.active_games.delete_many({"_id": {"$in": ids}})
+        except Exception:
+            log.exception("Не удалось закрыть записи ставок: %s", ids)
+
+    async def recover_active_games(self):
+        """При старте: любая запись в active_games = игра не завершена -> рефанд ставки и удаление записи.
+        Удаление и возврат — одна транзакция; если запись уже удалена (другой инстанс) — пропускаем."""
+        docs = await self.bot.active_games.find({}).to_list(None)
+        refunded = 0
+        for doc in docs:
+            try:
+                gid, uid, bet = int(doc["guild_id"]), int(doc["user_id"]), int(doc["bet"])
+                game = str(doc.get("game", "game"))
+                async with await self.bot.mongo.start_session() as session:
+                    async with session.start_transaction():
+                        deleted = await self.bot.active_games.delete_one({"_id": doc["_id"]}, session=session)
+                        if deleted.deleted_count != 1:
+                            continue
+                        if bet > 0:
+                            await self.pay_out(gid, uid, bet, f"{game}_refund", session=session, force=True)
+                refunded += 1
+                log.warning("Рефанд после рестарта: guild=%s uid=%s game=%s bet=%s", gid, uid, game, bet)
+            except Exception:
+                log.exception("Не удалось вернуть ставку после рестарта: %s", doc.get("_id"))
+        if docs:
+            log.warning("Незавершённых игр: %s, возвращено ставок: %s", len(docs), refunded)
 
     def _result_embed(self, title, body, bet, payout, cash, color):
         return make_embed(
@@ -2726,11 +2954,11 @@ class CasinoCog(commands.Cog):
                 await asyncio.sleep(1)
         winning_lines = self._slot_winning_lines(final_grid)
         line_count = len(winning_lines)
-        multiplier = 0 if line_count == 0 else (2 if line_count == 1 else 4 if line_count == 2 else 10)
+        multiplier = slot_multiplier(line_count)
         payout = bet * multiplier
         async with await self.bot.mongo.start_session() as session:
             async with session.start_transaction():
-                await self.take_bet(gid, uid, bet, "slot", max_payout=bet * 10, session=session)
+                await self.take_bet(gid, uid, bet, "slot", max_payout=bet * SLOT_MAX_MULT, session=session)
                 await self.pay_out(gid, uid, payout, "slot", session=session)
         cash = int((await self.bot.get_balance(gid, uid)).get("cash", 0))
         title = (f"🎉 Джекпот! ×{multiplier}" if line_count >= 3 else
@@ -2783,6 +3011,8 @@ class CasinoCog(commands.Cog):
     @commands.hybrid_command(name="casino-stats", aliases=["cs", "cstats"], description="Статистика казино игрока")
     @app_commands.describe(member="Чью статистику показать")
     async def casinostats(self, ctx, member: discord.Member = None):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         member = member or ctx.author
         doc = await self.bot.casino_stats.find_one(ukey(ctx.guild.id, member.id))
         if not doc or not int(doc.get("games", 0)):
@@ -2822,44 +3052,56 @@ class CasinoCog(commands.Cog):
                              description="Русская рулетка: соло или с друзьями, можно забрать выигрыш")
     @app_commands.describe(bet="Ставка наличными или all")
     async def rr(self, ctx, bet: str):
-        if not await self._require_module(ctx, "🎰 Казино"): return
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         gid, uid = ctx.guild.id, ctx.author.id
-        if (gid, uid) in self.active_rr:
+        key = (gid, uid)
+        # Проверка и резервирование — подряд, БЕЗ await между ними. Ключ переходит во владение
+        # RRModeView (reserved=True) и освобождается по окончании игры / таймауту выбора режима.
+        if key in self.active_rr:
             return await send_embed(ctx, "danger", "Ошибка", "У тебя уже идёт игра в рулетку.")
-        bet = await self._resolve_bet(ctx, bet)
-        if bet is None: return
+        self.active_rr.add(key)
+        handed_off = False
         try:
-            await self.precheck(gid, uid, bet)
-        except EconomyError as e:
-            return await send_embed(ctx, "danger", "Ошибка", str(e))
-        view = RRModeView(self, ctx.author, gid, bet)
-        embed = make_embed("info", "🔫 Русская рулетка",
-            description=("Шанс пули — **1 из 6** на каждый выстрел.\n"
-                         "Пусто — множитель растёт (×1.18, ×1.41, ×1.69 …), пуля — ставка потеряна.\n"
-                         "«Забрать» — получить ставку × текущий множитель.\n\n"
-                         "Выбери режим:"),
-            fields=[("💰 Ставка", f"{COIN_EMOJI} `{fmt(bet)}`", True)],
-            footer="Ставка спишется после выбора режима")
-        msg = await safe_send(ctx, embed=embed, view=view)
-        if msg is None:
-            return
-        try:
-            view.message = ctx.channel.get_partial_message(msg.id)   # правки по токену бота, без лимита 15 минут
-        except AttributeError:
-            view.message = msg
+            if not await self._require_module(ctx, "🎰 Казино"): return
+            bet = await self._resolve_bet(ctx, bet)
+            if bet is None: return
+            try:
+                await self.precheck(gid, uid, bet)
+            except EconomyError as e:
+                return await send_embed(ctx, "danger", "Ошибка", str(e))
+            view = RRModeView(self, ctx.author, gid, bet)
+            embed = make_embed("info", "🔫 Русская рулетка",
+                description=("Шанс пули — **1 из 6** на каждый выстрел.\n"
+                             "Пусто — множитель растёт (×1.18, ×1.41, ×1.69 …), пуля — ставка потеряна.\n"
+                             "«Забрать» — получить ставку × текущий множитель.\n\n"
+                             "Выбери режим:"),
+                fields=[("💰 Ставка", f"{COIN_EMOJI} `{fmt(bet)}`", True)],
+                footer="Ставка спишется после выбора режима")
+            msg = await safe_send(ctx, embed=embed, view=view)
+            if msg is None:
+                return
+            handed_off = True
+            try:
+                view.message = ctx.channel.get_partial_message(msg.id)   # правки по токену бота, без лимита 15 минут
+            except AttributeError:
+                view.message = msg
+        finally:
+            if not handed_off:
+                self.active_rr.discard(key)
 
     # ----- финансы рулетки (все операции — в транзакциях) -----
     async def rr_take_stake(self, gid: int, uid: int, bet: int):
         await self.precheck(gid, uid, bet)
         async with await self.bot.mongo.start_session() as session:
             async with session.start_transaction():
-                await self.take_bet(gid, uid, bet, RR_GAME, session=session,
-                                    max_payout=int(bet * rr_multiplier(RR_MAX_STEPS)))
+                return await self.take_bet(gid, uid, bet, RR_GAME, session=session, track=True,
+                                           max_payout=int(bet * rr_multiplier(RR_MAX_STEPS)))
 
     async def rr_refund(self, gid: int, players):
         for p in players:
             try:
-                await self.settle_payout(gid, p.uid, p.bet, "russian_roulette_refund")
+                await self.settle_payout(gid, p.uid, p.bet, "russian_roulette_refund", stake_id=p.stake_id)
             except Exception:
                 log.exception("Не удалось вернуть ставку рулетки guild=%s uid=%s", gid, p.uid)
             self.active_rr.discard((gid, p.uid))
@@ -2895,198 +3137,44 @@ class CasinoCog(commands.Cog):
     @commands.hybrid_command(name="bj", aliases=["blackjack"], description="Блэкджек")
     @app_commands.describe(bet="Ставка наличными или all")
     async def bj(self, ctx, bet: str):
-        if not await self._require_module(ctx, "🎰 Казино"): return
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         gid, uid = ctx.guild.id, ctx.author.id
         key = (gid, uid)
+        # Проверка и резервирование — подряд, БЕЗ await между ними: два быстрых вызова не пройдут оба.
         if key in self.active_bj:
             return await send_embed(ctx, "danger", "Ошибка", "У тебя уже идёт партия в блэкджек.")
-        bet = await self._resolve_bet(ctx, bet)
-        if bet is None: return
         self.active_bj.add(key)
+        handed_off = False      # True — дальше ключ освобождает сама партия (BlackjackView._finish)
         try:
-            await self.precheck(gid, uid, bet)
-            async with await self.bot.mongo.start_session() as session:
-                async with session.start_transaction():
-                    await self.take_bet(gid, uid, bet, "blackjack", max_payout=bet * 2, session=session)
-        except EconomyError as e:
-            self.active_bj.discard(key)
-            return await send_embed(ctx, "danger", "Ошибка", str(e))
-        except Exception:
-            self.active_bj.discard(key)
-            raise
-        view = BlackjackView(self, gid, uid, bet)
-        message = await safe_send(ctx, embed=view.render(), view=view)
-        if message is None:
+            if not await self._require_module(ctx, "🎰 Казино"): return
+            bet = await self._resolve_bet(ctx, bet)
+            if bet is None: return
             try:
-                await self.settle_payout(gid, uid, bet, "blackjack_refund")
-            except Exception:
-                log.exception("Не удалось вернуть ставку blackjack")
-            self.active_bj.discard(key)
-            return
-        view.message = message
-        if hand_value(view.player) == 21:
-            async with view.lock:
-                await view._finish(None, "twentyone")
-
-
-# =============================================================================
-# БИРЖА
-# =============================================================================
-def stock_sid(guild_id, ticker) -> str:
-    """_id акции. Привязан к серверу, чтобы экономика серверов оставалась изолированной."""
-    return f"{int(guild_id)}:{ticker}"
-
-def hkey(guild_id, user_id, ticker) -> dict:
-    return {"guild_id": int(guild_id), "user_id": int(user_id), "ticker": ticker}
-
-def fmt_price(value) -> str:
-    return f"{float(value):,.2f}".replace(",", " ")
-
-def stock_rows(st) -> list:
-    """История акции -> строки для _render_chart (created_at + price), с текущей ценой в конце."""
-    hist = [float(x) for x in (st.get("history") or [])]
-    ts = [as_utc(t) for t in (st.get("history_ts") or [])]
-    if len(ts) != len(hist) or any(t is None for t in ts):
-        end, n = now(), len(hist)
-        ts = [end - timedelta(minutes=STOCK_TICK_MINUTES * (n - 1 - i)) for i in range(n)]
-    rows = [{"created_at": t, "price": p} for t, p in zip(ts, hist)]
-    rows.append({"created_at": now(), "price": float(st["price"])})
-    return rows
-
-def stock_change_24h(rows, current) -> float:
-    cutoff = now() - timedelta(hours=24)
-    base = rows[0]["price"] if rows else current
-    for r in rows[:-1]:
-        if r["created_at"] <= cutoff:
-            base = r["price"]
-        else:
-            break
-    return (current / base - 1) * 100 if base > 0 else 0.0
-
-
-def fit_lines(lines, empty="—", limit=1000) -> str:
-    """Склеивает строки так, чтобы уложиться в лимит поля эмбеда (1024)."""
-    if not lines:
-        return empty
-    out, used = [], 0
-    for i, line in enumerate(lines):
-        if used + len(line) + 1 > limit - 30:
-            out.append(f"… и ещё {len(lines) - i}")
-            break
-        out.append(line)
-        used += len(line) + 1
-    return "\n".join(out)
-
-
-class StockTickerButton(discord.ui.Button):
-    def __init__(self, ticker: str):
-        super().__init__(label=ticker, style=discord.ButtonStyle.secondary)
-        self.ticker = ticker
-
-    async def callback(self, interaction: discord.Interaction):
-        await self.view.show_info(interaction, self.ticker)
-
-
-class StockListView(discord.ui.View):
-    """Кнопки под !stock list: до 5 самых дорогих акций сервера."""
-    def __init__(self, cog, guild_id: int, tickers):
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.guild_id = int(guild_id)
-        self.message = None
-        for ticker in list(tickers)[:STOCK_LIST_BUTTONS]:
-            self.add_item(StockTickerButton(ticker))
-
-    async def interaction_check(self, interaction: discord.Interaction):
-        # изоляция: кнопки работают только на том сервере, где был вызван список
-        if interaction.guild_id != self.guild_id:
-            await reply_ephemeral(interaction, "❌ Эта биржа принадлежит другому серверу.")
-            return False
-        return True
-
-    async def show_info(self, interaction: discord.Interaction, ticker: str):
-        gid = self.guild_id
-        if not await self.cog.bot.module_enabled(gid, "stocks"):
-            return await reply_ephemeral(interaction, "❌ Биржа отключена администратором сервера.")
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            payload = await self.cog._build_info(
-                gid, interaction.user.id, interaction.guild.name if interaction.guild else "", ticker)
-        except Exception:
-            log.exception("Stock button info failed %s", ticker)
-            return await interaction.followup.send("⚠️ Не удалось загрузить акцию.", ephemeral=True)
-        if payload is None:
-            return await interaction.followup.send(
-                f"❌ Акция `{ticker}` не найдена на этом сервере.", ephemeral=True)
-        embeds, files = payload
-        kwargs = {"files": files} if files else {}
-        await interaction.followup.send(embeds=embeds, ephemeral=True, **kwargs)
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message is not None:
-            try:
-                await self.message.edit(view=self)
-            except (discord.HTTPException, TypeError, ValueError):
-                pass
-
-
-class StockCog(commands.Cog):
-    def __init__(self, bot: EconomyBot):
-        self.bot = bot
-        self._last_trade = {}
-
-    async def _require_module(self, ctx) -> bool:
-        if await self.bot.module_enabled(ctx.guild.id, "stocks"):
-            return True
-        await send_embed(ctx, "danger", "Биржа отключена",
-                         "Администратор сервера выключил этот модуль. Включить можно через `/settings`.")
-        return False
-
-    def _throttle(self, gid, uid) -> float:
-        key, t = (gid, uid), time.monotonic()
-        left = STOCK_TRADE_COOLDOWN - (t - self._last_trade.get(key, -1e9))
-        if left > 0:
-            return left
-        self._last_trade[key] = t
-        return 0.0
-
-    @staticmethod
-    def _parse_ticker(raw) -> str:
-        return str(raw or "").strip().upper()
-
-    async def _get_stock(self, gid, ticker):
-        # изоляция: и _id ("guild_id:ticker"), и guild_id в фильтре
-        return await self.bot.stocks.find_one(
-            {"_id": stock_sid(gid, ticker), "guild_id": int(gid)})
-
-    @staticmethod
-    def _looks_like_ticker(token) -> bool:
-        """Ручной тикер в prefix-команде пишется ЗАГЛАВНЫМИ (иначе первое слово — часть названия)."""
-        token = str(token or "").strip()
-        return bool(token) and token == token.upper() and bool(STOCK_TICKER_RE.match(token))
-
-    @staticmethod
-    def _auto_ticker_base(name: str) -> str:
-        """Первые 4 заглавные буквы названия (без пробелов и знаков)."""
-        letters = re.sub(r"[^A-ZА-ЯЁ0-9]", "", name.upper())
-        return letters[:STOCK_AUTO_TICKER_LEN]
-
-    async def _free_ticker(self, gid, base, session):
-        """База свободна → база; занята → база+цифра (KORP, KORP1, KORP2 …). Только в рамках сервера."""
-        pattern = f"^{re.escape(base)}[0-9]*$"
-        taken = {d["ticker"] async for d in self.bot.stocks.find(
-            {"guild_id": int(gid), "ticker": {"$regex": pattern}}, {"ticker": 1}, session=session)}
-        if base not in taken:
-            return base
-        for n in range(1, 100):
-            cand = f"{base}{n}"
-            if len(cand) > 6:
-                break
-            if cand not in taken:
-                return cand
-        return None
+                await self.precheck(gid, uid, bet)
+                async with await self.bot.mongo.start_session() as session:
+                    async with session.start_transaction():
+                        stake_id = await self.take_bet(gid, uid, bet, "blackjack",
+                                                       max_payout=bet * 2, session=session, track=True)
+            except EconomyError as e:
+                return await send_embed(ctx, "danger", "Ошибка", str(e))
+            view = BlackjackView(self, gid, uid, bet)
+            view.stake_id = stake_id
+            message = await safe_send(ctx, embed=view.render(), view=view)
+            if message is None:
+                try:
+                    await self.settle_payout(gid, uid, bet, "blackjack_refund", stake_id=stake_id)
+                except Exception:
+                    log.exception("Не удалось вернуть ставку blackjack")
+                return
+            view.message = message
+            handed_off = True
+            if hand_value(view.player) == 21:
+                async with view.lock:
+                    await view._finish(None, "twentyone")
+        finally:
+            if not handed_off:
+                self.active_bj.discard(key)
 
     # ---------- группа ----------
     @commands.hybrid_group(name="stock", aliases=["stocks"], description="Биржа", invoke_without_command=True)
@@ -3123,6 +3211,8 @@ class StockCog(commands.Cog):
     @app_commands.describe(ticker="Тикер (2–6 символов). Пусто — создам из названия",
                            name="Название компании")
     async def stock_create(self, ctx, ticker: Optional[str] = None, *, name: Optional[str] = None):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if not await self._require_module(ctx): return
         gid, uid = ctx.guild.id, ctx.author.id
         ticker_raw, name_raw = ticker, name
@@ -3197,6 +3287,8 @@ class StockCog(commands.Cog):
     # ---------- мои акции ----------
     @stock.command(name="my", description="Мои акции и выпущенные компании на этом сервере")
     async def stock_my(self, ctx):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if not await self._require_module(ctx): return
         gid, uid = ctx.guild.id, ctx.author.id
         holds = await self.bot.stock_holdings.find(
@@ -3232,6 +3324,8 @@ class StockCog(commands.Cog):
     @commands.hybrid_command(name="buy", description="Купить акции")
     @app_commands.describe(ticker="Тикер", amount="Количество акций")
     async def stock_buy(self, ctx, ticker: str, amount: int):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if not await self._require_module(ctx): return
         gid, uid = ctx.guild.id, ctx.author.id
         ticker = self._parse_ticker(ticker)
@@ -3299,6 +3393,8 @@ class StockCog(commands.Cog):
     @commands.hybrid_command(name="sell", description="Продать акции")
     @app_commands.describe(ticker="Тикер", amount="Количество или all")
     async def stock_sell(self, ctx, ticker: str, amount: str):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if not await self._require_module(ctx): return
         gid, uid = ctx.guild.id, ctx.author.id
         ticker = self._parse_ticker(ticker)
@@ -3756,6 +3852,8 @@ class SettingsCog(commands.Cog):
     @commands.has_permissions(administrator=True)
     @commands.guild_only()
     async def settings_panel(self, ctx):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         cfg = await self.bot.get_settings(ctx.guild.id)
         ai_on = await guild_ai_enabled(self.bot, ctx.guild.id)
         view = SettingsView(self.bot, ctx.author.id, ctx.guild, cfg, ai_on)
