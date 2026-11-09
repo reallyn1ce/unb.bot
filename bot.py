@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import FuncFormatter
 
-BOT_VERSION = "7.5.0"
+BOT_VERSION = "7.6.0"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_USER = os.getenv("MONGO_USER")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
@@ -206,6 +206,13 @@ class EconomyError(Exception):
 
 class CooldownError(EconomyError):
     pass
+
+class TreasuryEmptyError(EconomyError):
+    """В Резерве ЦБ не хватает средств на выплату."""
+    pass
+
+TREASURY_EMPTY_TEXT = ("В казне пусто, подождите пока налоги пополнят бюджет. "
+                       "Админ может пополнить резерв командой `!print-money`.")
 
 
 # ====================== УТИЛИТЫ ======================
@@ -947,29 +954,28 @@ class EconomyBot(commands.Bot):
                            session=session, guild_id=guild_id)
 
     async def _pay_earning_tx(self, session, guild_id, user_id, gross, tax, net, reason, account, tax_rate):
+        """Заработок = перевод из Резерва ЦБ: reserve -gross, игрок +net, госбюджет +tax.
+        Денежная масса не меняется, `printed` НЕ растёт (деньги напечатаны ранее через !print-money).
+        Всё выполняется в транзакции вызывающего: если резерва не хватает — бросаем исключение,
+        транзакция откатывается целиком (в т.ч. кулдаун, если его взял вызывающий)."""
+        if gross > 0:
+            # атомарное условное списание: {reserve: {$gte: gross}} -> иначе modified_count == 0
+            if not await self.change_reserve(guild_id, -gross, session=session):
+                raise TreasuryEmptyError(TREASURY_EMPTY_TEXT)
         await self.db_users.update_one(
             ukey(guild_id, user_id),
             {"$inc": {account: net}, "$set": {"updated_at": now()}}, session=session)
         await self.add_budget(guild_id, tax, f"НДФЛ {fmt_pct(tax_rate)}: {reason}",
-                              session=session, source=f"user_{user_id}")
-        await self.journal("economy", f"user_{user_id}", net, reason,
-                           {"gross": gross, "tax": tax, "tax_rate": tax_rate},
+                              session=session, source="central_bank")
+        await self.journal("central_bank", f"user_{user_id}", net, reason,
+                           {"gross": gross, "tax": tax, "tax_rate": tax_rate, "type": "earning"},
                            session=session, guild_id=guild_id)
-        # Заработок создаётся «из воздуха» (net игроку + налог в бюджет = gross),
-        # поэтому учитываем его как эмиссию, чтобы денежная масса в !cb сходилась.
-        if gross > 0:
-            await self.economy.update_one(
-                {"_id": self.cb_id(guild_id)},
-                {"$inc": {"printed": gross}, "$set": {"updated_at": now()},
-                 "$setOnInsert": {"guild_id": int(guild_id), "reserve": 0, "created_at": now()}},
-                upsert=True, session=session)
-            await self.journal("money_printing", "economy", gross, f"Эмиссия: {reason}",
-                               {"type": "earning_emission", "tax": tax},
-                               session=session, guild_id=guild_id)
-            self.invalidate_inflation(guild_id)
 
     async def pay_earning(self, guild_id, user_id, gross, reason, *, tax_rate,
                           account="cash", session=None):
+        """Выплата заработка из Резерва ЦБ. Возвращает (gross, tax, net).
+        Бросает TreasuryEmptyError, если резерва недостаточно.
+        Передай session, чтобы выплата и, например, кулдаун были ОДНОЙ транзакцией."""
         gross = max(0, int(gross))
         tax = int(gross * float(tax_rate))
         net = gross - tax
@@ -1386,7 +1392,7 @@ class EconomyCog(commands.Cog):
     async def _inflation_fields(self, guild_id, s):
         cfg = await self.bot.get_settings(guild_id)
         if cfg.get("preset") == "easy":
-            return []
+            return [("📈 Инфляция", "`отключена`", True)]
         return [("📈 Инфляция", f"`{s['inflation']:.2f}%`", True)]
 
     @commands.hybrid_command(name="help", aliases=["h"], description="Команды экономики")
@@ -1467,17 +1473,30 @@ class EconomyCog(commands.Cog):
             gross = int(gross * factor)
             infl_cut = (1 - factor) * 100
         try:
-            async with await self.bot.mongo.start_session() as session:
-                async with session.start_transaction():
-                    if not await self.bot.claim_cooldown(gid, uid, "work", cooldown, session=session):
-                        raise CooldownError("cooldown")
-                    _, tax, net = await self.bot.pay_earning(
-                        gid, uid, gross, "Зарплата за работу",
-                        tax_rate=cfg["tax_rate"], session=session)
+            # Одна транзакция: кулдаун + списание из резерва + НДФЛ в бюджет + зачисление игроку.
+            # Любое исключение (в т.ч. пустая казна) откатывает всё — кулдаун не тратится.
+            # Резерв — «горячий» документ: при write-conflict транзакцию повторяем.
+            for attempt in range(3):
+                try:
+                    async with await self.bot.mongo.start_session() as session:
+                        async with session.start_transaction():
+                            if not await self.bot.claim_cooldown(gid, uid, "work", cooldown, session=session):
+                                raise CooldownError("cooldown")
+                            _, tax, net = await self.bot.pay_earning(
+                                gid, uid, gross, "Зарплата за работу",
+                                tax_rate=cfg["tax_rate"], session=session)
+                    break
+                except OperationFailure as e:
+                    if attempt < 2 and e.has_error_label("TransientTransactionError"):
+                        await asyncio.sleep(0.05 * (attempt + 1))
+                        continue
+                    raise
         except CooldownError:
             remaining = await self.bot.cooldown_left(gid, uid, "work", cooldown)
             return await send_embed(ctx, "warning", "Ты устал",
                                     f"Следующая работа через **{fmt_duration(remaining)}**.")
+        except TreasuryEmptyError as e:
+            return await send_embed(ctx, "danger", "🏦 Казна пуста", str(e))
         fields = [("💰 Начислено", f"`{fmt(gross)}`", True)]
         if infl_cut > 0:
             fields.append(("📉 Инфляция", f"`-{infl_cut:.1f}%` к зарплате", True))
