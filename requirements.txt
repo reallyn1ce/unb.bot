@@ -1,5 +1,5 @@
 discord.py
 motor
+pymongo
 aiohttp
 matplotlib
-pymongo
