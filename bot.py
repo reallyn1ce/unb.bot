@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import FuncFormatter
 
-BOT_VERSION = "8.0.0"
+BOT_VERSION = "9.1.1"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_USER = os.getenv("MONGO_USER")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
@@ -36,8 +36,6 @@ CHART_HOUR_UTC = 18
 COOLDOWN_MAX = 7 * 24 * 3600
 
 # ====================== КРИМИНАЛ ======================
-CRIME_REWARD = (300, 900)
-SLUT_REWARD = (200, 700)
 CRIME_FINE_RATE = 0.20
 CRIME_FINE_MAX = 500
 ROB_LOOT_RATE = (0.10, 0.30)
@@ -75,13 +73,32 @@ BJ_TIMEOUT = 90
 
 # ====================== БИРЖА ======================
 STOCK_CREATE_COST = 100_000        # стоимость IPO (уходит в резерв ЦБ)
-STOCK_START_PRICE = 100.0
+STOCK_START_PRICE = 100            # цена размещения (заявки идут целыми ценами, тик = 1)
 STOCK_START_SUPPLY = 1000          # акций выпускается при IPO
-STOCK_TRADE_STEP = 0.01            # ±1% цены за сделку
-STOCK_TICK_MAX = 0.03              # случайное движение раз в тик: ±3%
+STOCK_FOUNDER_PCT = 0.60           # доля основателя при IPO; остальное — свободное обращение
+STOCK_FOUNDER_MIN_PCT = 0.25       # основатель не может опустить долю ниже (защита от «слива»)
+COMPANY_UID = 0                    # «владелец» акций самой компании в stock_holdings / stock_orders
+STOCK_MIN_PRICE = 1
+STOCK_PRICE_BAND = 0.20            # заявка: не дальше ±20% от котировки
+STOCK_DAY_LIMIT = 0.30             # суточный лимит движения котировки (±30% к цене 24ч назад)
+STOCK_BOOK_FLOOR = 0.5             # цена заявки не ниже 50% балансовой стоимости (казна / акции)
+STOCK_FEE_PERMILLE = 20            # комиссия биржи с продавца: 2%
+STOCK_FEE_COMPANY_PCT = 60         # из комиссии: 60% — прибыль компании, 40% — госбюджет
+STOCK_QUOTE_WINDOW_HOURS = 24      # окно сделок для котировки
+STOCK_QUOTE_TRADES = 50
+STOCK_QUOTE_INERTIA = 0.02         # вес прежней котировки (доля от выпуска акций)
+STOCK_PAIR_CAP = 0.34              # вклад одной пары покупатель—продавец в котировку
+STOCK_MIN_TRADERS = 3              # котировка двигается, только если в окне торговали ≥3 разных игроков
+STOCK_QUOTE_HALFLIFE_H = 6         # «возраст» сделки: вес вдвое меньше каждые 6 часов
+STOCK_EARN_DAYS = 30               # справедливая цена: казна/акции + прибыль за столько дней
+STOCK_FAIR_DRIFT = 0.02            # без торгов котировка тянется к справедливой (доля разрыва за тик)
+STOCK_DIVIDEND_HOURS = 24
+STOCK_DEFAULT_PAYOUT = 0.50        # доля накопленной прибыли, идущая на дивиденды
+STOCK_MAX_FILLS = 25               # исполнений на одну заявку
+STOCK_MAX_OPEN_ORDERS = 10
 STOCK_TICK_MINUTES = 30
 STOCK_HISTORY_MAX = 5000           # точек истории на акцию
-STOCK_TRADE_COOLDOWN = 10          # сек между сделками одного игрока (анти-памп)
+STOCK_TRADE_COOLDOWN = 5           # сек между заявками одного игрока
 STOCK_TICKER_RE = re.compile(r"^[A-ZА-ЯЁ0-9]{2,6}$")
 STOCK_AUTO_TICKER_LEN = 4          # авто-тикер: первые 4 буквы названия
 STOCK_LIST_BUTTONS = 5             # кнопок под !stock list (самые дорогие акции)
@@ -120,6 +137,7 @@ PRESETS = {
             "loan_interest": 0.0, "loan_penalty": 0.0,
             "business_tax": 0.0,
             "inflation_multiplier": 0.0,
+            "crime_min": 300, "crime_max": 900, "slut_min": 200, "slut_max": 700,
         },
     },
     "standard": {
@@ -133,6 +151,7 @@ PRESETS = {
             "loan_interest": 0.20, "loan_penalty": 0.05,
             "business_tax": 0.05,
             "inflation_multiplier": 0.5,
+            "crime_min": 300, "crime_max": 900, "slut_min": 200, "slut_max": 700,
         },
     },
     "hardcore": {
@@ -146,6 +165,7 @@ PRESETS = {
             "loan_interest": 0.50, "loan_penalty": 0.10,
             "business_tax": 0.10,
             "inflation_multiplier": 1.0,
+            "crime_min": 300, "crime_max": 900, "slut_min": 200, "slut_max": 700,
         },
     },
 }
@@ -169,7 +189,27 @@ SETTING_SPECS = {
     "loan_penalty": ("rate", 0.0, 0.5, "Штраф просрочки (в сутки)", "0.05 или 5%"),
     "work_min": ("int", 0, 1_000_000, "Зарплата !work: минимум", "200"),
     "work_max": ("int", 0, 1_000_000, "Зарплата !work: максимум", "700"),
+    "crime_min": ("int", 0, 1_000_000, "Награда !crime: минимум", "300"),
+    "crime_max": ("int", 0, 1_000_000, "Награда !crime: максимум", "900"),
+    "slut_min": ("int", 0, 1_000_000, "Награда !slut: минимум", "200"),
+    "slut_max": ("int", 0, 1_000_000, "Награда !slut: максимум", "700"),
 }
+# Пары «минимум/максимум»: минимум не может превышать максимум, отрицательных значений нет
+REWARD_RANGES = (("work_min", "work_max", "Зарплата !work"),
+                 ("crime_min", "crime_max", "Награда !crime"),
+                 ("slut_min", "slut_max", "Награда !slut"))
+
+def reward_range_errors(cfg, touched=None):
+    """Ошибки диапазонов наград. touched — набор изменяемых ключей (None — проверить все пары)."""
+    errors = []
+    for lo, hi, label in REWARD_RANGES:
+        if touched is not None and lo not in touched and hi not in touched:
+            continue
+        if cfg[lo] < 0 or cfg[hi] < 0:
+            errors.append(f"• **{label}**: значения не могут быть отрицательными")
+        elif cfg[lo] > cfg[hi]:
+            errors.append(f"• **{label}**: минимум больше максимума")
+    return errors
 SETTING_SECTIONS = {
     "chances": {"label": "🎲 Шансы", "title": "Шансы успеха",
                 "keys": ["crime_chance", "rob_chance"]},
@@ -180,6 +220,8 @@ SETTING_SECTIONS = {
                            "cooldown_rob"]},
     "pay": {"label": "💰 Зарплата", "title": "Зарплата !work",
             "keys": ["work_min", "work_max"]},
+    "rewards": {"label": "🕵️ Награды crime/slut", "title": "Награды !crime и !slut",
+                "keys": ["crime_min", "crime_max", "slut_min", "slut_max"]},
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -302,7 +344,7 @@ def parse_setting(key, raw):
         return value
     try:
         value = int(float(text))
-    except ValueError:
+    except (ValueError, OverflowError):
         raise ValueError("ожидается целое число")
     if not lo <= value <= hi:
         raise ValueError(f"допустимо от {fmt(lo)} до {fmt(hi)}")
@@ -431,6 +473,10 @@ class EconomyBot(commands.Bot):
         self.casino_stats = None
         self.stocks = None
         self.stock_holdings = None
+        self.stock_orders = None
+        self.stock_trades = None
+        self.stock_dividends = None
+        self.stock_payouts = None
         self.active_games = None
         self._settings_cache = {}
         self._infl_cache = {}
@@ -476,20 +522,34 @@ class EconomyBot(commands.Bot):
         self.casino_stats = self.db.casino_stats
         self.stocks = self.db.stocks
         self.stock_holdings = self.db.stock_holdings
+        self.stock_orders = self.db.stock_orders
+        self.stock_trades = self.db.stock_trades
+        self.stock_dividends = self.db.stock_dividends
+        self.stock_payouts = self.db.stock_payouts
         self.active_games = self.db.active_games
 
         await safe_create_index(self.history, "created_at")
+        await safe_create_index(self.history, [("guild_id", 1), ("created_at", 1)])   # графики по серверу
         await safe_create_index(self.tx, "created_at")
         await safe_create_index(self.tx, [("guild_id", 1), ("created_at", 1)])
         await safe_create_index(self.db_users, [("guild_id", 1), ("user_id", 1)],
                                 unique=True, drop_on_conflict=True)
         await safe_create_index(self.db_users, [("guild_id", 1), ("cash", -1)])
+        await safe_create_index(self.db_users, [("debt", 1)])                          # loan_loop: debt > 0
         await safe_create_index(self.businesses, [("guild_id", 1), ("user_id", 1)],
                                 unique=True, drop_on_conflict=True)
         await safe_create_index(self.casino_stats, [("guild_id", 1), ("user_id", 1)],
                                 unique=True, drop_on_conflict=True)
         await safe_create_index(self.stocks, "guild_id")
-        await safe_create_index(self.stocks, [("guild_id", 1), ("ticker", 1)])
+        await safe_create_index(self.stocks, [("guild_id", 1), ("ticker", 1)],
+                                unique=True, drop_on_conflict=True)
+        await safe_create_index(self.stock_holdings, [("guild_id", 1), ("ticker", 1)])  # держатели акции
+        await safe_create_index(self.stock_orders, [("guild_id", 1), ("ticker", 1), ("side", 1),
+                                                    ("status", 1), ("price", 1), ("created_at", 1)])
+        await safe_create_index(self.stock_orders, [("guild_id", 1), ("user_id", 1), ("status", 1)])
+        await safe_create_index(self.stock_trades, [("guild_id", 1), ("ticker", 1), ("at", -1)])
+        await safe_create_index(self.stock_dividends, [("guild_id", 1), ("ticker", 1), ("at", -1)])
+        await safe_create_index(self.stock_payouts, [("guild_id", 1), ("user_id", 1), ("at", -1)])
         await safe_create_index(self.stock_holdings, [("guild_id", 1), ("user_id", 1), ("ticker", 1)],
                                 unique=True, drop_on_conflict=True)
         await safe_create_index(self.active_games, [("guild_id", 1), ("user_id", 1)])
@@ -503,6 +563,8 @@ class EconomyBot(commands.Bot):
         await self.add_cog(casino)
         # Рестарт во время игры: возвращаем ставки всех незавершённых партий
         await casino.recover_active_games()
+        # Миграция биржи на V2 — до запуска команд и фоновых задач (идемпотентна)
+        await self.migrate_stocks_v2()
         await self.add_cog(StockCog(self))
         await self.add_cog(SettingsCog(self))
 
@@ -816,6 +878,73 @@ class EconomyBot(commands.Bot):
             await self.run_tx(_txn)
         return gross, tax, net
 
+    # ---------- Миграция биржи V1 -> V2 ----------
+    async def migrate_stocks_v2(self):
+        """Старые компании получают поля V2. Цена, число выпущенных акций, истории и все
+        позиции игроков сохраняются как есть. Единственное перемещение: доля основателя
+        сверх STOCK_FOUNDER_PCT выставляется на рынок его собственной заявкой по текущей цене
+        (раньше эти акции и так продавались «у владельца»), чтобы рынок появился сразу."""
+        count = 0
+        async for old in self.stocks.find({"schema_v2": {"$ne": True}}, {"_id": 1}):
+            try:
+                await self.run_tx(lambda s, sid=old["_id"]: self._migrate_stock(s, sid))
+                count += 1
+            except Exception:
+                log.exception("Миграция акции %s не удалась", old.get("_id"))
+        if count:
+            log.info("Биржа V2: мигрировано компаний: %s", count)
+
+    async def _migrate_stock(self, session, sid):
+        st = await self.stocks.find_one({"_id": sid}, session=session)
+        if not st or st.get("schema_v2") is True:
+            return
+        gid, ticker = int(st["guild_id"]), st["ticker"]
+        owner = int(st.get("owner_id") or 0)
+        price = float(st.get("price") or STOCK_START_PRICE)
+        ts = now()
+        supply = max(0, int(st.get("supply") or 0))
+        holds = await self.stock_holdings.find({"guild_id": gid, "ticker": ticker},
+                                               session=session).to_list(100000)
+        held = sum(max(0, int(h.get("shares", 0))) for h in holds)
+        if held > supply:
+            supply = held                       # учёт важнее старого поля
+        missing = supply - held                 # «потерянные» акции возвращаем компании
+        ask = max(STOCK_MIN_PRICE, int(round(price)))
+        listings = []
+        if owner:
+            mine = next((h for h in holds if int(h.get("user_id", -1)) == owner), None)
+            have = max(0, int((mine or {}).get("shares", 0)))
+            excess = have - int(supply * STOCK_FOUNDER_PCT)
+            if excess > 0:
+                await self.stock_holdings.update_one(
+                    {"guild_id": gid, "user_id": owner, "ticker": ticker},
+                    {"$inc": {"shares": -excess}, "$set": {"updated_at": ts}}, session=session)
+                listings.append((owner, excess))
+        if missing > 0:
+            listings.append((COMPANY_UID, missing))
+        for uid, qty in listings:
+            oid = uuid.uuid4().hex
+            await self.stock_orders.insert_one({
+                "_id": oid, "short": oid[:6], "guild_id": gid, "ticker": ticker, "side": "sell",
+                "user_id": uid, "price": ask, "qty": qty, "left": qty, "escrow": 0,
+                "status": "open", "created_at": ts, "updated_at": ts, "migrated": True},
+                session=session)
+        await self.stocks.update_one({"_id": sid}, {"$set": {
+            "supply": supply, "treasury": 0, "profit_pool": 0,
+            "payout_ratio": STOCK_DEFAULT_PAYOUT, "lifetime_revenue": 0, "lifetime_dividends": 0,
+            "volume_total": 0, "last_trade_price": price, "last_trade_at": None,
+            "last_dividend_at": ts, "migrated_at": ts, "schema_v2": True}}, session=session)
+
+    async def stock_locked(self, guild_id) -> int:
+        """Деньги, замороженные биржей: казны компаний + эскроу заявок на покупку."""
+        gid = int(guild_id)
+        t = await self.stocks.aggregate([
+            {"$match": {"guild_id": gid}}, {"$group": {"_id": None, "n": {"$sum": "$treasury"}}}]).to_list(1)
+        e = await self.stock_orders.aggregate([
+            {"$match": {"guild_id": gid, "side": "buy", "status": "open"}},
+            {"$group": {"_id": None, "n": {"$sum": "$escrow"}}}]).to_list(1)
+        return (int(t[0]["n"]) if t else 0) + (int(e[0]["n"]) if e else 0)
+
     async def stats(self, guild_id):
         """Статистика ТОЛЬКО по указанному серверу."""
         gid = int(guild_id)
@@ -829,6 +958,7 @@ class EconomyBot(commands.Bot):
         ]).to_list(1)
         p = players_rows[0] if players_rows else {}
         players = int(p.get("cash", 0)) + int(p.get("bank", 0))
+        locked = await self.stock_locked(gid)          # казны компаний и заявки на покупку
         player_debt = int(p.get("debt", 0))
         since = now() - timedelta(hours=24)
         incoming = await self.tx.aggregate([
@@ -842,12 +972,12 @@ class EconomyBot(commands.Bot):
             {"$group": {"_id": None, "n": {"$sum": "$amount"}}},
         ]).to_list(1)
         printed = int((await self.economy.find_one({"_id": self.cb_id(gid)}) or {}).get("printed", 0))
-        supply = reserve + players + budget
+        supply = reserve + players + budget + locked
         printed_24h, burned_24h = await self.emission_24h(gid)
         return {
             "reserve": reserve, "budget": budget,
             "players": players, "player_debt": player_debt,
-            "circulation": players + budget,
+            "circulation": players + budget + locked, "stock_locked": locked,
             "debt": max(0, -reserve), "supply": supply,
             "printed": printed,
             "printed_24h": printed_24h, "burned_24h": burned_24h,
@@ -910,7 +1040,8 @@ class EconomyBot(commands.Bot):
         p = rows[0] if rows else {}
         players = int(p.get("cash", 0)) + int(p.get("bank", 0))
         printed_24h, burned_24h = await self.emission_24h(gid)
-        value = self.calc_inflation(printed_24h - burned_24h, reserve + players + budget)
+        locked = await self.stock_locked(gid)
+        value = self.calc_inflation(printed_24h - burned_24h, reserve + players + budget + locked)
         self._infl_cache[gid] = (time.monotonic(), value)
         return value
 
@@ -1083,32 +1214,12 @@ class EconomyBot(commands.Bot):
 
     @tasks.loop(minutes=STOCK_TICK_MINUTES)
     async def stock_loop(self):
-        """Раз в 30 минут: случайное движение цен на ±3% + запись в history."""
-        current = now()
-        async for st in self.stocks.find({}):
-            try:
-                gid = int(st.get("guild_id", 0))
-                if not gid or not await self.module_enabled(gid, "stocks"):
-                    continue
-                last = as_utc(st.get("last_tick"))
-                # защита от лишнего тика при перезапуске бота
-                if last and (current - last).total_seconds() < (STOCK_TICK_MINUTES - 1) * 60:
-                    continue
-                for _attempt in range(3):
-                    pct = rng.uniform(-STOCK_TICK_MAX, STOCK_TICK_MAX)
-                    price = max(1.0, round(float(st["price"]) * (1 + pct), 2))
-                    res = await self.stocks.update_one(
-                        {"_id": st["_id"], "price": st["price"]},   # не затираем параллельную сделку
-                        {"$set": {"price": price, "last_tick": current, "updated_at": current},
-                         "$push": {"history": {"$each": [price], "$slice": -STOCK_HISTORY_MAX},
-                                   "history_ts": {"$each": [current], "$slice": -STOCK_HISTORY_MAX}}})
-                    if res.modified_count == 1:
-                        break
-                    st = await self.stocks.find_one({"_id": st["_id"]})
-                    if not st:
-                        break
-            except Exception:
-                log.exception("Stock tick failed %s", st.get("_id") if st else None)
+        """Раз в 30 минут: дрейф к справедливой цене при отсутствии торгов, цена размещения
+        компании, дивиденды. Случайных движений цены больше нет."""
+        cog = self.get_cog("StockCog")
+        if cog is not None:
+            try: await cog.market_tick()
+            except Exception: log.exception("Stock loop failed")
 
     @stock_loop.before_loop
     async def before_stock_loop(self): await self.wait_until_ready()
@@ -1159,7 +1270,7 @@ class EconomyBot(commands.Bot):
 # ====================== КРИМИНАЛ-ТЕКСТЫ ======================
 CRIME_ACTIONS = {
     "crime": {
-        "title": "🕵️ Кража", "reward": CRIME_REWARD,
+        "title": "🕵️ Кража",
         "win": ["Ты тихо вскрыл склад и ушёл незамеченным.",
                 "Охрана смотрела футбол — ты вынес всё, что плохо лежало.",
                 "Карманная кража в метро прошла идеально."],
@@ -1170,7 +1281,7 @@ CRIME_ACTIONS = {
         "reason_win": "Кража: добыча", "reason_fine": "Штраф за неудачную кражу",
     },
     "slut": {
-        "title": "💋 Ночная подработка", "reward": SLUT_REWARD,
+        "title": "💋 Ночная подработка",
         "win": ["Клиент оказался щедрым и оставил хорошие чаевые.",
                 "Вечер удался — смена принесла отличный заработок.",
                 "VIP-гость заплатил вдвое больше обычного."],
@@ -1288,7 +1399,9 @@ class EconomyCog(commands.Cog):
         cfg = await self.bot.get_settings(gid)
         cooldown = cfg[f"cooldown_{key}"]
         success = rng.random() < cfg["crime_chance"]
-        reward = rng.randint(*cfg_action["reward"])
+        # Диапазон награды — из настроек сервера (/settings); защита от испорченных значений в БД
+        low, high = sorted((max(0, int(cfg[f"{key}_min"])), max(0, int(cfg[f"{key}_max"]))))
+        reward = rng.randint(low, high)
         fine = 0
         try:
             async def _txn(session):
@@ -1298,12 +1411,13 @@ class EconomyCog(commands.Cog):
                 if success:
                     # Добыча выплачивается из резерва ЦБ (reserve -> cash): масса не растёт,
                     # printed не трогаем — иначе эмиссия была бы посчитана дважды.
-                    if not await self.bot.change_reserve(gid, -reward, session=session):
-                        raise EconomyError("В резерве ЦБ недостаточно средств. Попроси админа сделать эмиссию.")
-                    await self.bot.change_cash(gid, uid, reward, session=session)
-                    await self.bot.journal("central_bank", f"user_{uid}", reward,
-                                           cfg_action["reason_win"], {"type": key},
-                                           session=session, guild_id=gid)
+                    if reward > 0:
+                        if not await self.bot.change_reserve(gid, -reward, session=session):
+                            raise EconomyError("В резерве ЦБ недостаточно средств. Попроси админа сделать эмиссию.")
+                        await self.bot.change_cash(gid, uid, reward, session=session)
+                        await self.bot.journal("central_bank", f"user_{uid}", reward,
+                                               cfg_action["reason_win"], {"type": key},
+                                               session=session, guild_id=gid)
                 else:
                     user = await self.bot.db_users.find_one(ukey(gid, uid), session=session) or {}
                     cash, bank = int(user.get("cash", 0)), int(user.get("bank", 0))
@@ -2261,6 +2375,7 @@ class RRGameView(discord.ui.View):
         self.log = []
         self.lock = asyncio.Lock()
         self.ended = False
+        self.final_view = None          # RRAgainView после окончания раунда
         self._timer = None
         self._turn_id = 0
         self._sync_buttons()
@@ -2326,14 +2441,17 @@ class RRGameView(discord.ui.View):
     async def _push(self, interaction=None):
         self._sync_buttons()
         embed = self.render()
+        view = self.final_view if self.final_view is not None else self
+        if self.final_view is not None:
+            self.final_view.message = self.message
         try:
             if interaction is not None:
-                await interaction.edit_original_response(embed=embed, view=self)
+                await interaction.edit_original_response(embed=embed, view=view)
                 return
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
         try:
-            await self.message.edit(embed=embed, view=self)
+            await self.message.edit(embed=embed, view=view)
         except (discord.NotFound, discord.Forbidden):
             log.warning("Не удалось обновить сообщение рулетки")
         except discord.HTTPException:
@@ -2443,6 +2561,8 @@ class RRGameView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         self.stop()
+        # Старые кнопки раунда заменяются одной кнопкой «Играть снова» (новый раунд — с чистого листа)
+        self.final_view = RRAgainView(self.cog, self.guild_id, [p.uid for p in self.players])
         await self._push(interaction)
         return True
 
@@ -2515,6 +2635,111 @@ class RRGameView(discord.ui.View):
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         log.error("Ошибка в русской рулетке", exc_info=error)
         await self.abort("Внутренняя ошибка.")
+
+
+class RRAgainView(discord.ui.View):
+    """Кнопка «Играть снова» под итогом раунда.
+
+    Нажатие открывает форму новой ставки — ничего не переносится из прошлого раунда (ни ставка,
+    ни режим). Дальше всё как у `!rr`: выбор режима, и только потом одно атомарное списание ставки.
+    Кнопка одноразовая для каждого участника: повторные нажатия по старому сообщению
+    не создают новых игр.
+    """
+    def __init__(self, cog, guild_id: int, player_ids):
+        super().__init__(timeout=PLAY_AGAIN_TIMEOUT)
+        self.cog, self.guild_id = cog, int(guild_id)
+        self.players = {int(u) for u in player_ids}
+        self.used = set()               # uid, уже начавшие новую игру с этого сообщения
+        self.message = None
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.guild_id != self.guild_id:
+            await reply_ephemeral(interaction, "❌ Эта кнопка относится к другому серверу.")
+            return False
+        return True
+
+    @discord.ui.button(label="Играть снова", style=discord.ButtonStyle.success, emoji="🔄")
+    async def btn_again(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        key = (self.guild_id, uid)
+        if uid not in self.players:
+            return await reply_ephemeral(
+                interaction, "❌ Кнопка для участников этого раунда. Начни свою игру: `!rr ставка`.")
+        if key in self.cog.active_rr:
+            return await reply_ephemeral(interaction, "❌ У тебя уже идёт игра в рулетку.")
+        if uid in self.used:
+            return await reply_ephemeral(interaction, "❌ Новая игра с этого раунда уже запущена.")
+        if not await self.cog.bot.module_enabled(self.guild_id, "casino"):
+            return await reply_ephemeral(interaction, "❌ Казино отключено администратором.")
+        user = await self.cog.bot.ensure_user(self.guild_id, uid)
+        if int(user.get("cash", 0)) < CASINO_MIN_BET:
+            return await reply_ephemeral(
+                interaction, f"❌ Недостаточно наличных: нужно минимум `{fmt(CASINO_MIN_BET)}`.")
+        await interaction.response.send_modal(RRBetModal(self))
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        log.error("Ошибка кнопки «Играть снова» (рулетка)", exc_info=error)
+        await reply_ephemeral(interaction, "⚠️ Внутренняя ошибка. Попробуй ещё раз.")
+
+
+class RRBetModal(discord.ui.Modal):
+    """Форма новой ставки. Ставка не списывается здесь — только после выбора режима (RRModeView)."""
+    def __init__(self, again: RRAgainView):
+        super().__init__(title="Русская рулетка — новая игра", timeout=120)
+        self.again = again
+        self.bet_input = discord.ui.TextInput(
+            label="Ставка (число или all)", placeholder=f"от {CASINO_MIN_BET} до {CASINO_MAX_BET}",
+            required=True, max_length=12)
+        self.add_item(self.bet_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cog, gid, uid = self.again.cog, self.again.guild_id, interaction.user.id
+        key = (gid, uid)
+        if interaction.guild_id != gid:
+            return await reply_ephemeral(interaction, "❌ Эта игра относится к другому серверу.")
+        # Проверка и резервирование — подряд, БЕЗ await между ними: два быстрых отправления не пройдут оба.
+        if key in cog.active_rr:
+            return await reply_ephemeral(interaction, "❌ У тебя уже идёт игра в рулетку.")
+        if uid in self.again.used or uid not in self.again.players:
+            return await reply_ephemeral(interaction, "❌ Новая игра с этого раунда уже запущена.")
+        cog.active_rr.add(key)
+        handed_off = False
+        try:
+            if not await cog.bot.module_enabled(gid, "casino"):
+                return await reply_ephemeral(interaction, "❌ Казино отключено администратором.")
+            user = await cog.bot.ensure_user(gid, uid)
+            bet = parse_amount(self.bet_input.value, min(int(user.get("cash", 0)), CASINO_MAX_BET))
+            if bet is None:
+                return await reply_ephemeral(interaction, "❌ Укажи ставку числом или `all`.")
+            try:
+                await cog.precheck(gid, uid, bet)           # границы ставки и баланс
+            except EconomyError as e:
+                return await reply_ephemeral(interaction, f"❌ {e}")
+            view = RRModeView(cog, interaction.user, gid, bet)
+            await interaction.response.send_message(embed=cog.rr_intro_embed(bet), view=view)
+            msg = await interaction.original_response()
+            try:
+                view.message = interaction.channel.get_partial_message(msg.id)
+            except AttributeError:
+                view.message = msg
+            self.again.used.add(uid)
+            handed_off = True               # ключ дальше освобождает RRModeView / RRGameView
+        finally:
+            if not handed_off:
+                cog.active_rr.discard(key)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.error("Ошибка формы новой ставки (рулетка)", exc_info=error)
+        await reply_ephemeral(interaction, "⚠️ Внутренняя ошибка. Попробуй ещё раз.")
 
 
 class CasinoCog(commands.Cog):
@@ -2795,14 +3020,7 @@ class CasinoCog(commands.Cog):
             except EconomyError as e:
                 return await send_embed(ctx, "danger", "Ошибка", str(e))
             view = RRModeView(self, ctx.author, gid, bet)
-            embed = make_embed("info", "🔫 Русская рулетка",
-                description=("Шанс пули — **1 из 6** на каждый выстрел.\n"
-                             "Пусто — множитель растёт (×1.18, ×1.41, ×1.69 …), пуля — ставка потеряна.\n"
-                             "«Забрать» — получить ставку × текущий множитель.\n\n"
-                             "Выбери режим:"),
-                fields=[("💰 Ставка", f"{COIN_EMOJI} `{fmt(bet)}`", True)],
-                footer="Ставка спишется после выбора режима")
-            msg = await safe_send(ctx, embed=embed, view=view)
+            msg = await safe_send(ctx, embed=self.rr_intro_embed(bet), view=view)
             if msg is None:
                 return
             handed_off = True
@@ -2813,6 +3031,16 @@ class CasinoCog(commands.Cog):
         finally:
             if not handed_off:
                 self.active_rr.discard(key)
+
+    @staticmethod
+    def rr_intro_embed(bet: int):
+        return make_embed("info", "🔫 Русская рулетка",
+            description=("Шанс пули — **1 из 6** на каждый выстрел.\n"
+                         "Пусто — множитель растёт (×1.18, ×1.41, ×1.69 …), пуля — ставка потеряна.\n"
+                         "«Забрать» — получить ставку × текущий множитель.\n\n"
+                         "Выбери режим:"),
+            fields=[("💰 Ставка", f"{COIN_EMOJI} `{fmt(bet)}`", True)],
+            footer="Ставка спишется после выбора режима")
 
     # ----- финансы рулетки (все операции — в транзакциях) -----
     async def rr_take_stake(self, gid: int, uid: int, bet: int):
@@ -2904,7 +3132,7 @@ class CasinoCog(commands.Cog):
 
 
 # =============================================================================
-# БИРЖА: вспомогательные функции и кнопки
+# БИРЖА V2: чистые функции (без БД — удобно тестировать)
 # =============================================================================
 def stock_sid(guild_id, ticker) -> str:
     return f"{int(guild_id)}:{ticker}"
@@ -2925,7 +3153,6 @@ def stock_rows(st) -> list:
         if ts is not None:
             rows.append({"created_at": ts, "price": float(p)})
     cur = float(st.get("price", 0) or 0)
-    # сделки меняют цену без записи в историю — добавляем текущую точку на график
     if cur > 0 and (not rows or abs(rows[-1]["price"] - cur) > 1e-9):
         rows.append({"created_at": as_utc(st.get("updated_at")) or now(), "price": cur})
     if not rows:
@@ -2945,6 +3172,18 @@ def stock_change_24h(rows, price) -> float:
             break
     return (float(price) / base - 1) * 100 if base > 0 else 0.0
 
+def day_anchor(st) -> float:
+    """Котировка ~24 часа назад: от неё считается суточный лимит движения цены."""
+    rows = stock_rows(st)
+    cutoff = now() - timedelta(hours=24)
+    base = rows[0]["price"]
+    for r in rows:
+        if r["created_at"] <= cutoff:
+            base = r["price"]
+        else:
+            break
+    return base if base > 0 else float(st.get("price", STOCK_START_PRICE) or STOCK_START_PRICE)
+
 def fit_lines(lines, empty: str, limit: int = 1000) -> str:
     """Склеивает строки в значение поля эмбеда (лимит Discord — 1024 символа)."""
     if not lines:
@@ -2959,6 +3198,95 @@ def fit_lines(lines, empty: str, limit: int = 1000) -> str:
         used += extra
     return "\n".join(out)
 
+def split_fee(value: int):
+    """Комиссия биржи с продавца (целые числа, без потерь): (всего, компании, в бюджет)."""
+    fee = int(value) * STOCK_FEE_PERMILLE // 1000
+    company = fee * STOCK_FEE_COMPANY_PCT // 100
+    return fee, company, fee - company
+
+def stock_price_band(quote, anchor, book_per_share=0.0):
+    """Допустимый диапазон ЦЕЛЫХ цен заявок (lo, hi).
+
+    Ограничен отклонением от котировки (±STOCK_PRICE_BAND), суточным лимитом от котировки
+    24 часа назад (±STOCK_DAY_LIMIT) и снизу — долей балансовой стоимости (деньги в казне компании).
+    Диапазон всегда включает round(котировка) ±1, чтобы дешёвые акции не «застывали».
+    """
+    q = float(quote)
+    hi = min(q * (1 + STOCK_PRICE_BAND), float(anchor) * (1 + STOCK_DAY_LIMIT))
+    lo = max(q * (1 - STOCK_PRICE_BAND), float(anchor) * (1 - STOCK_DAY_LIMIT),
+             STOCK_BOOK_FLOOR * float(book_per_share), STOCK_MIN_PRICE)
+    base = max(STOCK_MIN_PRICE, int(round(q)))
+    lo_i = min(math.ceil(lo), max(STOCK_MIN_PRICE, base - 1))
+    hi_i = max(math.floor(hi), base + 1)
+    return max(STOCK_MIN_PRICE, lo_i), max(hi_i, lo_i)
+
+def weighted_median(samples):
+    """Взвешенная медиана [(цена, вес)]. Устойчива к одиночным «выбросам»."""
+    pts = sorted((float(p), float(w)) for p, w in samples if w > 0)
+    total = sum(w for _p, w in pts)
+    if total <= 0:
+        return None
+    acc = 0.0
+    for p, w in pts:
+        acc += w
+        if acc * 2 >= total:
+            return p
+    return pts[-1][0]
+
+def compute_quote(prev_price, supply, trades, ref_time=None):
+    """Новая котировка по сделкам за окно (новые первыми): [{'price','qty','buyer','seller','at','primary'}].
+
+    — только вторичный рынок: первичные продажи идут по цене размещения и ценой не являются;
+    — нужно не менее STOCK_MIN_TRADERS разных игроков, иначе котировка не меняется;
+    — медиана, взвешенная объёмом и свежестью (не «последняя сделка» и не фиксированный шаг);
+    — вклад одной пары «покупатель—продавец» ограничен долей STOCK_PAIR_CAP от объёма окна
+      (защита от накрутки между двумя аккаунтами);
+    — прежняя котировка входит с весом «инерции»: мелкая сделка цену не двигает, объём — двигает.
+    """
+    ref_time = ref_time or now()
+    sec = [t for t in trades if not t.get("primary")]
+    traders = {int(x) for t in sec for x in (t["buyer"], t["seller"]) if int(x) != COMPANY_UID}
+    if len(traders) < STOCK_MIN_TRADERS:
+        return float(prev_price)
+    total = sum(int(t["qty"]) for t in sec)
+    cap = max(1, math.ceil(total * STOCK_PAIR_CAP))
+    used, samples = {}, []
+    for t in sec:
+        pair = frozenset((int(t["buyer"]), int(t["seller"])))
+        room = cap - used.get(pair, 0)
+        if room <= 0:
+            continue
+        w = min(int(t["qty"]), room)
+        used[pair] = used.get(pair, 0) + w
+        at = as_utc(t.get("at"))
+        age_h = max(0.0, (ref_time - at).total_seconds() / 3600) if at else 0.0
+        samples.append((float(t["price"]), w * 0.5 ** (age_h / STOCK_QUOTE_HALFLIFE_H)))
+    samples.append((float(prev_price), max(1.0, int(supply) * STOCK_QUOTE_INERTIA)))
+    return weighted_median(samples)
+
+def clamp_quote(value, anchor) -> float:
+    value = min(max(float(value), float(anchor) * (1 - STOCK_DAY_LIMIT), STOCK_MIN_PRICE),
+                float(anchor) * (1 + STOCK_DAY_LIMIT))
+    return round(max(STOCK_MIN_PRICE, value), 2)
+
+def fair_value(treasury, supply, profit_week):
+    """Справедливая стоимость акции = деньги в казне на акцию + прибыль за STOCK_EARN_DAYS дней."""
+    supply = int(supply)
+    if supply <= 0:
+        return None
+    return int(treasury) / supply + (int(profit_week) / 7 / supply) * STOCK_EARN_DAYS
+
+def dividend_split(amount, holders):
+    """Раздел суммы пропорционально акциям: {user_id: выплата}. Сумма выплат <= amount."""
+    outstanding = sum(holders.values())
+    if outstanding <= 0 or amount <= 0:
+        return {}
+    out = {}
+    for uid, shares in holders.items():
+        part = int(amount) * int(shares) // outstanding
+        if part > 0:
+            out[uid] = part
+    return out
 
 class StockTickerButton(discord.ui.Button):
     def __init__(self, ticker: str):
@@ -3001,13 +3329,22 @@ class StockListView(discord.ui.View):
 
 
 # =============================================================================
-# БИРЖА
+# БИРЖА V2
 # =============================================================================
+# Модель:
+#  stocks          — компании: supply (выпущено всего), price (котировка), treasury (деньги компании),
+#                    profit_pool (нераспределённая прибыль, часть treasury), payout_ratio, owner_id.
+#  stock_holdings  — свободные акции игроков; user_id=0 — акции самой компании (первичное размещение).
+#  stock_orders    — книга заявок. Продажа резервирует акции, покупка — наличные (эскроу).
+#  stock_trades    — журнал сделок (основа котировки, объёма и прибыли компании).
+#  stock_dividends / stock_payouts — выплаты дивидендов (идемпотентность и история).
+# Инвариант: Σ holdings + Σ left открытых заявок на продажу == stocks.supply.
 class StockCog(commands.Cog):
     def __init__(self, bot: EconomyBot):
         self.bot = bot
-        self._last_trade = {}      # (guild_id, user_id) -> monotonic время последней сделки
+        self._last_trade = {}      # (guild_id, user_id) -> monotonic время последней заявки
 
+    # ---------- общие хелперы ----------
     async def _require_module(self, ctx) -> bool:
         if await self.bot.module_enabled(ctx.guild.id, "stocks"):
             return True
@@ -3017,7 +3354,6 @@ class StockCog(commands.Cog):
         return False
 
     def _throttle(self, gid: int, uid: int) -> float:
-        """0 — сделка разрешена (и время зафиксировано); иначе секунд до следующей."""
         t, key = time.monotonic(), (int(gid), int(uid))
         if len(self._last_trade) > 5000:
             self._last_trade = {k: v for k, v in self._last_trade.items()
@@ -3053,7 +3389,416 @@ class StockCog(commands.Cog):
     async def _get_stock(self, gid: int, ticker: str):
         return await self.bot.stocks.find_one({"_id": stock_sid(gid, ticker), "guild_id": int(gid)})
 
-    # ---------- группа ----------
+    @staticmethod
+    def _band(st):
+        supply = max(1, int(st.get("supply", 1)))
+        book = int(st.get("treasury", 0)) / supply
+        return stock_price_band(float(st["price"]), day_anchor(st), book)
+
+    async def _add_shares(self, gid, uid, ticker, qty, *, session):
+        await self.bot.stock_holdings.update_one(
+            hkey(gid, uid, ticker),
+            {"$inc": {"shares": int(qty)}, "$set": {"updated_at": now()}},
+            upsert=True, session=session)
+
+    async def _company_shares(self, gid, ticker, session=None) -> int:
+        """Акции самой компании (казначейские): свободные + в её заявках на продажу."""
+        h = await self.bot.stock_holdings.find_one(hkey(gid, COMPANY_UID, ticker), session=session)
+        total = int((h or {}).get("shares", 0))
+        async for o in self.bot.stock_orders.find(
+                {"guild_id": int(gid), "ticker": ticker, "user_id": COMPANY_UID,
+                 "side": "sell", "status": "open"}, session=session):
+            total += int(o.get("left", 0))
+        return total
+
+    async def _profit_days(self, gid, ticker, days, session=None) -> int:
+        rows = await self.bot.stock_trades.aggregate([
+            {"$match": {"guild_id": int(gid), "ticker": ticker,
+                        "at": {"$gte": now() - timedelta(days=days)}}},
+            {"$group": {"_id": None, "n": {"$sum": "$fee_company"}}}], session=session).to_list(1)
+        return int(rows[0]["n"]) if rows else 0
+
+    # =========================================================================
+    # ЯДРО: размещение заявки + сопоставление (всё внутри транзакции вызывающего)
+    # =========================================================================
+    async def _place_tx(self, session, gid, uid, ticker, side, qty, price, *, system=False):
+        """Размещает заявку и исполняет её против книги. Возвращает dict с итогом.
+
+        price=None — рыночная заявка (исполняется сразу по лучшим ценам в допустимом диапазоне,
+        остаток отменяется). system=True — заявка самой компании (uid=0): без проверок диапазона,
+        выручка идёт в казну компании. Исполнение по цене РЕЗИДЕНТНОЙ заявки (maker).
+        Деньги покупателя заранее заморожены в заявке, акции продавца — тоже, поэтому
+        «продать больше, чем есть» и «потратить больше, чем есть» невозможно.
+        """
+        bot = self.bot
+        gid, uid, qty = int(gid), int(uid), int(qty)
+        sid = stock_sid(gid, ticker)
+        st = await bot.stocks.find_one({"_id": sid, "guild_id": gid}, session=session)
+        if not st:
+            raise EconomyError(f"Акция `{ticker}` не найдена.")
+        ts = now()
+        supply = int(st.get("supply", 0))
+        quote = float(st["price"])
+        owner = int(st.get("owner_id", 0))
+        buy = side == "buy"
+        if qty <= 0 or qty > max(supply, 1):
+            raise EconomyError("Неверное количество акций.")
+        lo, hi = self._band(st)
+        is_market = price is None
+        if system:
+            limit = int(price)
+        elif is_market:
+            limit = hi if buy else lo
+        else:
+            limit = int(price)
+            if not lo <= limit <= hi:
+                raise EconomyError(
+                    f"Цена заявки должна быть в диапазоне `{lo}`–`{hi}` "
+                    f"(котировка `{fmt_price(quote)}`; диапазон защищает от манипуляций).")
+        if limit < STOCK_MIN_PRICE:
+            raise EconomyError("Цена должна быть не меньше 1.")
+        if not is_market and not system:
+            opened = await bot.stock_orders.count_documents(
+                {"guild_id": gid, "user_id": uid, "status": "open"}, session=session)
+            if opened >= STOCK_MAX_OPEN_ORDERS:
+                raise EconomyError(f"Не больше {STOCK_MAX_OPEN_ORDERS} открытых заявок. "
+                                   "Отмени лишние: `!stock cancel`.")
+
+        # ---- резервирование ресурсов (эскроу) ----
+        escrow = 0
+        if buy:
+            escrow = limit * qty
+            if not await bot.change_cash(gid, uid, -escrow, session=session):
+                raise EconomyError(
+                    f"Недостаточно наличных: нужно `{fmt(escrow)}`"
+                    + (" (рыночная заявка резервирует деньги по максимальной цене)" if is_market else "") + ".")
+        else:
+            # Доля основателя. В stock_holdings лежат только СВОБОДНЫЕ акции: всё, что уже выставлено
+            # на продажу, из них вычтено (эскроу). Значит, свободные акции — это то, что останется
+            # у основателя, если ВСЕ его открытые заявки исполнятся. Новая заявка допустима, только
+            # если после неё свободный остаток не ниже минимума: доступно = свободные − минимум.
+            # (Раньше сюда прибавлялись акции из открытых заявок, и лимит можно было «потратить»
+            # несколько раз подряд.)
+            min_free = 0
+            if uid == owner and not system:
+                min_free = math.ceil(supply * STOCK_FOUNDER_MIN_PCT)
+                held = await bot.stock_holdings.find_one(hkey(gid, uid, ticker), session=session)
+                free_now = int((held or {}).get("shares", 0))
+                allowed = max(0, free_now - min_free)
+                if qty > allowed:
+                    raise EconomyError(
+                        f"Основатель обязан держать не менее {STOCK_FOUNDER_MIN_PCT:.0%} акций "
+                        f"({fmt(min_free)} шт.), с учётом уже выставленных заявок. "
+                        f"Можно выставить ещё: `{fmt(allowed)}`.")
+            # Условное списание проверяет минимум и в самой БД — даже при устаревшем чтении выше
+            taken = await bot.stock_holdings.update_one(
+                {**hkey(gid, uid, ticker), "shares": {"$gte": qty + min_free}},
+                {"$inc": {"shares": -qty}, "$set": {"updated_at": ts}}, session=session)
+            if taken.modified_count != 1:
+                raise EconomyError("Недостаточно свободных акций (часть может быть в заявках"
+                                   + (" или действует минимальная доля основателя)." if min_free else ")."))
+
+        # ---- сопоставление ----
+        flt = {"guild_id": gid, "ticker": ticker, "side": "sell" if buy else "buy",
+               "status": "open", "left": {"$gt": 0}, "user_id": {"$ne": uid}}   # без сделок с собой
+        flt["price"] = {"$lte": limit} if buy else {"$gte": limit}
+        order_by = [("price", 1 if buy else -1), ("created_at", 1)]
+        makers = await bot.stock_orders.find(flt, session=session).sort(order_by) \
+            .limit(STOCK_MAX_FILLS * 3).to_list(STOCK_MAX_FILLS * 3)
+
+        left, n_fills, capped = qty, 0, False
+        spent = received = fee_paid = filled = 0
+        d_treasury = d_profit = 0
+        trade_docs, last_px = [], None
+        for m in makers:
+            if left <= 0:
+                break
+            if n_fills >= STOCK_MAX_FILLS:
+                capped = True
+                break
+            m_left = int(m["left"])
+            q = min(left, m_left)
+            px = int(m["price"])
+            value = px * q
+            mf = {"_id": m["_id"], "status": "open", "left": q if q == m_left else {"$gt": q}}
+            inc = {"left": -q}
+            if not buy:                      # maker — заявка на покупку с замороженными деньгами
+                mf["escrow"] = {"$gte": value}
+                inc["escrow"] = -value
+            mupd = {"$inc": inc, "$set": {"updated_at": ts}}
+            if q == m_left:
+                mupd["$set"]["status"] = "filled"
+            if (await bot.stock_orders.update_one(mf, mupd, session=session)).modified_count != 1:
+                continue
+            m_uid = int(m["user_id"])
+            buyer, seller = (uid, m_uid) if buy else (m_uid, uid)
+            if buy:
+                escrow -= value
+            await self._add_shares(gid, buyer, ticker, q, session=session)
+            if seller == COMPANY_UID:        # первичное размещение: без комиссии, деньги — в капитал компании
+                fee = fc = fb = 0
+                d_treasury += value
+            else:
+                fee, fc, fb = split_fee(value)
+                await bot.ensure_user(gid, seller, session=session)
+                await bot.db_users.update_one(
+                    ukey(gid, seller), {"$inc": {"cash": value - fee}, "$set": {"updated_at": ts}},
+                    session=session)
+                d_treasury += fc
+                d_profit += fc
+                if fb > 0:
+                    await bot.add_budget(gid, fb, f"Биржевой сбор {ticker}", session=session,
+                                         source=f"user_{seller}")
+                if fc > 0:
+                    await bot.journal(f"user_{seller}", f"company_{ticker}", fc,
+                                      f"Комиссия биржи: доход компании {ticker}",
+                                      {"type": "stock_company_revenue", "ticker": ticker},
+                                      session=session, guild_id=gid)
+            await bot.journal(f"user_{buyer}",
+                              f"user_{seller}" if seller != COMPANY_UID else f"company_{ticker}",
+                              value, f"Сделка с акциями {ticker}",
+                              {"type": "stock_trade", "ticker": ticker, "shares": q,
+                               "price": px, "fee": fee}, session=session, guild_id=gid)
+            trade_docs.append({"guild_id": gid, "ticker": ticker, "price": px, "qty": q,
+                               "value": value, "fee": fee, "fee_company": fc, "fee_budget": fb,
+                               "buyer": buyer, "seller": seller, "taker": uid,
+                               "primary": seller == COMPANY_UID, "at": ts})
+            if buy:
+                spent += value
+            else:
+                received += value - fee
+            fee_paid += fee if not buy else 0
+            filled += q
+            left -= q
+            n_fills += 1
+            last_px = px
+
+        # ---- остаток заявки ----
+        rest, cancelled, refund_cash = None, 0, 0
+        if left > 0:
+            if is_market or capped:
+                cancelled = left
+                if buy:
+                    refund_cash = escrow
+                else:
+                    await self._add_shares(gid, uid, ticker, left, session=session)
+            else:
+                keep_escrow = limit * left if buy else 0
+                if buy:
+                    refund_cash = escrow - keep_escrow        # «улучшение цены» возвращаем сразу
+                oid = uuid.uuid4().hex
+                await bot.stock_orders.insert_one({
+                    "_id": oid, "short": oid[:6], "guild_id": gid, "ticker": ticker, "side": side,
+                    "user_id": uid, "price": limit, "qty": qty, "left": left, "escrow": keep_escrow,
+                    "status": "open", "created_at": ts, "updated_at": ts}, session=session)
+                rest = {"id": oid[:6], "left": left, "price": limit}
+        elif buy:
+            refund_cash = escrow
+        if refund_cash < 0:
+            raise EconomyError("Ошибка учёта заявки.")      # недостижимо; откатит транзакцию
+        if refund_cash > 0:
+            await bot.db_users.update_one(
+                ukey(gid, uid), {"$inc": {"cash": refund_cash}, "$set": {"updated_at": ts}},
+                session=session)
+
+        # ---- котировка и финансы компании ----
+        new_quote = quote
+        if n_fills:
+            await bot.stock_trades.insert_many(trade_docs, session=session)
+            recent = await bot.stock_trades.find(
+                {"guild_id": gid, "ticker": ticker,
+                 "at": {"$gte": ts - timedelta(hours=STOCK_QUOTE_WINDOW_HOURS)}},
+                session=session).sort("at", -1).limit(STOCK_QUOTE_TRADES).to_list(STOCK_QUOTE_TRADES)
+            median = compute_quote(quote, supply, recent, ts)
+            new_quote = clamp_quote(median if median is not None else quote, day_anchor(st))
+            upd = {"$set": {"price": new_quote, "last_trade_price": last_px, "last_trade_at": ts,
+                            "updated_at": ts},
+                   "$inc": {"treasury": d_treasury, "profit_pool": d_profit,
+                            "lifetime_revenue": d_profit, "volume_total": filled}}
+            if abs(new_quote - quote) >= 0.005:
+                upd["$push"] = {"history": {"$each": [new_quote], "$slice": -STOCK_HISTORY_MAX},
+                                "history_ts": {"$each": [ts], "$slice": -STOCK_HISTORY_MAX}}
+            await bot.stocks.update_one({"_id": sid, "guild_id": gid}, upd, session=session)
+        return {"filled": filled, "spent": spent, "received": received, "fee": fee_paid,
+                "avg": (spent or received + fee_paid) / filled if filled else 0,
+                "rest": rest, "cancelled": cancelled, "refund": refund_cash,
+                "quote": new_quote, "name": st.get("name", ticker)}
+
+    async def _cancel_tx(self, session, gid, uid, short):
+        """Отмена своих открытых заявок: short=None — все. Возвращает (кол-во, акций, денег)."""
+        flt = {"guild_id": int(gid), "user_id": int(uid), "status": "open"}
+        if short:
+            flt["short"] = short
+        orders = await self.bot.stock_orders.find(flt, session=session).to_list(100)
+        if not orders:
+            raise EconomyError("Открытых заявок не найдено.")
+        shares = cash = 0
+        for o in orders:
+            res = await self.bot.stock_orders.update_one(
+                {"_id": o["_id"], "status": "open"},
+                {"$set": {"status": "cancelled", "updated_at": now()}}, session=session)
+            if res.modified_count != 1:
+                continue
+            if o["side"] == "sell":
+                await self._add_shares(gid, uid, o["ticker"], int(o["left"]), session=session)
+                shares += int(o["left"])
+            else:
+                await self.bot.change_cash(gid, uid, int(o["escrow"]), session=session)
+                cash += int(o["escrow"])
+        return len(orders), shares, cash
+
+    # =========================================================================
+    # ДИВИДЕНДЫ
+    # =========================================================================
+    async def _dividend_tx(self, session, gid, ticker, tax_rate, period):
+        bot = self.bot
+        sid = stock_sid(gid, ticker)
+        st = await bot.stocks.find_one({"_id": sid, "guild_id": gid}, session=session)
+        if not st:
+            return None
+        pool, treasury = int(st.get("profit_pool", 0)), int(st.get("treasury", 0))
+        ratio = min(1.0, max(0.0, float(st.get("payout_ratio", STOCK_DEFAULT_PAYOUT))))
+        # только из реальной прибыли И только если эти деньги есть в казне компании
+        amount = min(int(pool * ratio), pool, treasury)
+        if amount <= 0:
+            return None
+        holders = {}
+        async for h in bot.stock_holdings.find(
+                {"guild_id": gid, "ticker": ticker, "user_id": {"$gt": COMPANY_UID},
+                 "shares": {"$gt": 0}}, session=session):
+            holders[int(h["user_id"])] = holders.get(int(h["user_id"]), 0) + int(h["shares"])
+        async for o in bot.stock_orders.find(
+                {"guild_id": gid, "ticker": ticker, "side": "sell", "status": "open",
+                 "user_id": {"$gt": COMPANY_UID}, "left": {"$gt": 0}}, session=session):
+            holders[int(o["user_id"])] = holders.get(int(o["user_id"]), 0) + int(o["left"])
+        outstanding = sum(holders.values())      # акции самой компании дивидендов не получают
+        payouts = dividend_split(amount, holders)
+        total = sum(payouts.values())
+        if total <= 0:
+            return None
+        ts = now()
+        # идемпотентность: один документ на компанию и период (первая запись транзакции)
+        await bot.stock_dividends.insert_one({
+            "_id": f"{gid}:{ticker}:{period}", "guild_id": gid, "ticker": ticker, "period": period,
+            "total": total, "per_share": total / outstanding, "holders": len(payouts),
+            "outstanding": outstanding, "at": ts}, session=session)
+        res = await bot.stocks.update_one(
+            {"_id": sid, "guild_id": gid, "treasury": {"$gte": total}, "profit_pool": {"$gte": total}},
+            {"$inc": {"treasury": -total, "profit_pool": -total, "lifetime_dividends": total},
+             "$set": {"last_dividend_at": ts, "updated_at": ts}}, session=session)
+        if res.modified_count != 1:
+            raise EconomyError("В казне компании недостаточно средств для выплаты.")
+        tax_total, docs, journals = 0, [], []
+        for uid, gross in payouts.items():
+            tax = int(gross * float(tax_rate))
+            net = gross - tax
+            tax_total += tax
+            await bot.ensure_user(gid, uid, session=session)
+            await bot.db_users.update_one(
+                ukey(gid, uid), {"$inc": {"cash": net}, "$set": {"updated_at": ts}}, session=session)
+            docs.append({"guild_id": gid, "ticker": ticker, "user_id": uid, "period": period,
+                         "gross": gross, "tax": tax, "net": net, "at": ts})
+            journals.append({"source": f"company_{ticker}", "destination": f"user_{uid}",
+                             "amount": net, "reason": f"Дивиденды {ticker}",
+                             "meta": {"type": "stock_dividend", "gross": gross, "tax": tax},
+                             "created_at": ts, "guild_id": gid})
+        await bot.stock_payouts.insert_many(docs, session=session)
+        await bot.tx.insert_many(journals, session=session)
+        if tax_total > 0:
+            await bot.add_budget(gid, tax_total, f"Налог на дивиденды {ticker}", session=session,
+                                 source=f"company_{ticker}")
+        return {"total": total, "tax": tax_total, "holders": len(payouts), "outstanding": outstanding}
+
+    async def pay_dividends(self, gid, ticker):
+        gid = int(gid)
+        cfg = await self.bot.get_settings(gid)
+        period = int(now().timestamp() // (STOCK_DIVIDEND_HOURS * 3600))
+        try:
+            return await self.bot.run_tx(
+                lambda s: self._dividend_tx(s, gid, ticker, cfg["tax_rate"], period))
+        except DuplicateKeyError:
+            return None            # за этот период уже выплачено
+        except EconomyError:
+            log.warning("Dividend skipped %s:%s", gid, ticker)
+            return None
+
+    # =========================================================================
+    # ФОНОВЫЙ ТИК: дрейф к справедливой цене при отсутствии торгов, цена размещения, дивиденды
+    # =========================================================================
+    async def market_tick(self):
+        enabled = {}
+        async for st in self.bot.stocks.find({"schema_v2": True}):
+            try:
+                gid = int(st.get("guild_id", 0))
+                if not gid:
+                    continue
+                if gid not in enabled:
+                    enabled[gid] = await self.bot.module_enabled(gid, "stocks")
+                if not enabled[gid]:
+                    continue
+                await self._tick_one(st)
+            except Exception:
+                log.exception("Stock tick failed %s", st.get("_id"))
+
+    async def _tick_one(self, st):
+        gid, ticker = int(st["guild_id"]), st["ticker"]
+        current = now()
+        last = as_utc(st.get("last_trade_at")) or as_utc(st.get("created_at")) or current
+        # 1) нет торгов сутки -> котировка медленно (пропорционально разрыву) тянется к справедливой цене
+        if (current - last).total_seconds() >= STOCK_QUOTE_WINDOW_HOURS * 3600:
+            profit = await self._profit_days(gid, ticker, 7)
+            fair = fair_value(st.get("treasury", 0), st.get("supply", 0), profit)
+            quote = float(st["price"])
+            if fair and fair > 0 and abs(fair - quote) >= 0.01:
+                new = clamp_quote(quote + (fair - quote) * STOCK_FAIR_DRIFT, day_anchor(st))
+                if abs(new - quote) >= 0.005:
+                    await self.bot.stocks.update_one(
+                        {"_id": st["_id"], "price": st["price"]},
+                        {"$set": {"price": new, "updated_at": current},
+                         "$push": {"history": {"$each": [new], "$slice": -STOCK_HISTORY_MAX},
+                                   "history_ts": {"$each": [current], "$slice": -STOCK_HISTORY_MAX}}})
+        # 2) цена первичного размещения следует за рынком
+        await self._reprice_company(gid, ticker)
+        # 3) дивиденды раз в STOCK_DIVIDEND_HOURS
+        due = as_utc(st.get("last_dividend_at"))
+        if due is None or (current - due).total_seconds() >= STOCK_DIVIDEND_HOURS * 3600:
+            await self.pay_dividends(gid, ticker)
+
+    async def _reprice_company(self, gid, ticker):
+        fresh = await self._get_stock(gid, ticker)
+        if not fresh:
+            return
+        target = max(STOCK_MIN_PRICE, int(round(float(fresh["price"]))))
+        ask = await self.bot.stock_orders.find_one(
+            {"guild_id": gid, "ticker": ticker, "user_id": COMPANY_UID, "side": "sell", "status": "open"})
+        if ask and abs(int(ask["price"]) - target) * 100 < 3 * target:
+            return
+        if not ask:
+            idle = await self.bot.stock_holdings.find_one(hkey(gid, COMPANY_UID, ticker))
+            if int((idle or {}).get("shares", 0)) <= 0:
+                return          # всё размещено — продавать нечего
+
+        async def _txn(session):
+            total = 0
+            async for o in self.bot.stock_orders.find(
+                    {"guild_id": gid, "ticker": ticker, "user_id": COMPANY_UID,
+                     "side": "sell", "status": "open"}, session=session):
+                r = await self.bot.stock_orders.update_one(
+                    {"_id": o["_id"], "status": "open"},
+                    {"$set": {"status": "cancelled", "updated_at": now()}}, session=session)
+                if r.modified_count == 1:
+                    total += int(o["left"])
+            if total > 0:
+                await self._add_shares(gid, COMPANY_UID, ticker, total, session=session)
+                await self._place_tx(session, gid, COMPANY_UID, ticker, "sell", total, target, system=True)
+        try:
+            await self.bot.run_tx(_txn)
+        except EconomyError:
+            log.warning("Company reprice skipped %s:%s", gid, ticker)
+
+    # =========================================================================
+    # КОМАНДЫ
+    # =========================================================================
     @commands.hybrid_group(name="stock", aliases=["stocks"], description="Биржа", invoke_without_command=True)
     async def stock(self, ctx):
         if not await self._require_module(ctx): return
@@ -3070,17 +3815,17 @@ class StockCog(commands.Cog):
         if not docs:
             return await send_embed(ctx, "info", "📈 Биржа",
                 f"Пока нет ни одной акции.\n`!stock create [ТИКЕР] Название` — IPO за {fmt(STOCK_CREATE_COST)}.")
-        # в списке — по капитализации, кнопки — 5 самых ДОРОГИХ акций (по цене)
         by_price = sorted(docs, key=lambda d: float(d["price"]), reverse=True)
         docs.sort(key=lambda d: float(d["price"]) * int(d.get("supply", 0)), reverse=True)
         lines = []
         for d in docs[:15]:
-            rows = stock_rows(d)
-            ch = stock_change_24h(rows, float(d["price"]))
-            lines.append(f"**{d['ticker']}** — {d['name']}: `{fmt_price(d['price'])}` ({ch:+.1f}%)")
+            ch = stock_change_24h(stock_rows(d), float(d["price"]))
+            cap = float(d["price"]) * int(d.get("supply", 0))
+            lines.append(f"**{d['ticker']}** — {d['name']}: `{fmt_price(d['price'])}` "
+                         f"({ch:+.1f}%) • кап. `{fmt(cap)}`")
         view = StockListView(self, gid, [d["ticker"] for d in by_price[:STOCK_LIST_BUTTONS]])
         embed = make_embed("info", "📈 Биржа", "\n".join(lines),
-                           footer="Кнопки — 5 самых дорогих акций • !stock info ТИКЕР")
+                           footer="Кнопки — 5 самых дорогих акций • !stock info ТИКЕР • !stock book ТИКЕР")
         view.message = await safe_send(ctx, embed=embed, view=view)
 
     # ---------- IPO ----------
@@ -3094,11 +3839,10 @@ class StockCog(commands.Cog):
         gid, uid = ctx.guild.id, ctx.author.id
         ticker_raw, name_raw = ticker, name
         if ctx.interaction is None:
-            # prefix: !stock create [ТИКЕР] Название …
-            if name_raw is None:                     # одно слово/фраза в кавычках — это название
+            if name_raw is None:
                 name_raw, ticker_raw = ticker_raw, None
             elif ticker_raw and not self._looks_like_ticker(ticker_raw):
-                name_raw, ticker_raw = f"{ticker_raw} {name_raw}", None   # первое слово — часть названия
+                name_raw, ticker_raw = f"{ticker_raw} {name_raw}", None
         name = " ".join(str(name_raw or "").split())
         if not 2 <= len(name) <= 40:
             return await send_embed(ctx, "danger", "Неверное название",
@@ -3116,6 +3860,8 @@ class StockCog(commands.Cog):
             if not STOCK_TICKER_RE.match(ticker):
                 return await send_embed(ctx, "danger", "Неверный тикер",
                                         "Тикер: 2–6 символов, только буквы и цифры.")
+        founder_shares = int(STOCK_START_SUPPLY * STOCK_FOUNDER_PCT)
+        float_shares = STOCK_START_SUPPLY - founder_shares
         created = now()
         for attempt in range(3):
             try:
@@ -3130,16 +3876,21 @@ class StockCog(commands.Cog):
                         raise EconomyError(f"Тикер `{ticker}` уже занят на этом сервере.")
                     if not await self.bot.change_cash(gid, uid, -STOCK_CREATE_COST, session=session):
                         raise EconomyError(f"Для IPO нужно `{fmt(STOCK_CREATE_COST)}` наличными.")
-                    # деньги «сгорают» в резерв ЦБ — масса не меняется
                     await self.bot.change_reserve(gid, STOCK_CREATE_COST, session=session)
                     await self.bot.stocks.insert_one({
-                        "_id": sid, "guild_id": gid, "ticker": ticker, "name": name,
-                        "owner_id": uid, "price": STOCK_START_PRICE, "supply": STOCK_START_SUPPLY,
-                        "history": [STOCK_START_PRICE], "history_ts": [created],
-                        "last_tick": created, "created_at": created}, session=session)
-                    await self.bot.stock_holdings.insert_one({
-                        **hkey(gid, uid, ticker), "shares": STOCK_START_SUPPLY,
-                        "updated_at": created}, session=session)
+                        "_id": sid, "guild_id": gid, "ticker": ticker, "name": name, "owner_id": uid,
+                        "price": float(STOCK_START_PRICE), "last_trade_price": STOCK_START_PRICE,
+                        "supply": STOCK_START_SUPPLY, "treasury": 0, "profit_pool": 0,
+                        "payout_ratio": STOCK_DEFAULT_PAYOUT, "lifetime_revenue": 0,
+                        "lifetime_dividends": 0, "volume_total": 0,
+                        "history": [float(STOCK_START_PRICE)], "history_ts": [created],
+                        "last_tick": created, "last_dividend_at": created, "last_trade_at": None,
+                        "created_at": created, "schema_v2": True}, session=session)
+                    await self._add_shares(gid, uid, ticker, founder_shares, session=session)
+                    # свободное обращение: акции компании выставляются на рынок; выручка — в её казну
+                    await self._add_shares(gid, COMPANY_UID, ticker, float_shares, session=session)
+                    await self._place_tx(session, gid, COMPANY_UID, ticker, "sell",
+                                         float_shares, STOCK_START_PRICE, system=True)
                     await self.bot.journal(f"user_{uid}", "central_bank", STOCK_CREATE_COST,
                                            f"IPO: выпуск акций {ticker}",
                                            {"type": "stock_ipo", "ticker": ticker},
@@ -3147,7 +3898,7 @@ class StockCog(commands.Cog):
                 await self.bot.run_tx(_txn)
                 break
             except DuplicateKeyError:
-                if auto and attempt < 2:      # гонка за тот же авто-тикер — подбираем заново
+                if auto and attempt < 2:
                     continue
                 return await send_embed(ctx, "danger", "Ошибка", f"Тикер `{ticker}` уже занят.")
             except EconomyError as e:
@@ -3157,193 +3908,246 @@ class StockCog(commands.Cog):
         await send_embed(ctx, "success", f"🚀 IPO: {ticker}",
             description=f"Компания **{name}** вышла на биржу.",
             fields=[("Тикер", f"`{ticker}`" + (" (авто)" if auto else ""), True),
-                    ("Цена акции", f"`{fmt_price(STOCK_START_PRICE)}`", True),
-                    ("Твои акции", f"`{fmt(STOCK_START_SUPPLY)}`", True),
+                    ("Цена размещения", f"`{STOCK_START_PRICE}`", True),
+                    ("Выпущено акций", f"`{fmt(STOCK_START_SUPPLY)}`", True),
+                    ("Доля основателя", f"`{fmt(founder_shares)}` ({STOCK_FOUNDER_PCT:.0%})", True),
+                    ("В свободной продаже", f"`{fmt(float_shares)}` — выручка идёт в казну компании", True),
                     ("Сгорело в резерв ЦБ", f"`{fmt(STOCK_CREATE_COST)}`", True)],
+            footer="Дивиденды: !stock dividend • взнос в капитал: !stock invest",
             thumbnail=ctx.author.display_avatar.url)
 
-    # ---------- мои акции ----------
-    @stock.command(name="my", description="Мои акции и выпущенные компании на этом сервере")
-    async def stock_my(self, ctx):
+    # ---------- торговля ----------
+    async def _trade(self, ctx, side, ticker, amount_raw, price):
+        gid, uid = ctx.guild.id, ctx.author.id
+        ticker = self._parse_ticker(ticker)
+        if side == "sell":
+            mine = await self.bot.stock_holdings.find_one(hkey(gid, uid, ticker))
+            qty = parse_amount(amount_raw, int((mine or {}).get("shares", 0)))
+        else:
+            qty = parse_amount(amount_raw, 0)
+        if not qty or qty > 1_000_000:
+            return await send_embed(ctx, "danger", "Ошибка", "Укажи положительное количество акций"
+                                    + (" или `all`." if side == "sell" else "."))
+        if price is not None and price < STOCK_MIN_PRICE:
+            return await send_embed(ctx, "danger", "Ошибка", "Цена заявки должна быть не меньше 1.")
+        left = self._throttle(gid, uid)
+        if left > 0:
+            return await send_embed(ctx, "warning", "Не так быстро",
+                                    f"Следующая заявка через **{fmt_duration(left)}**.")
+        try:
+            r = await self.bot.run_tx(
+                lambda s: self._place_tx(s, gid, uid, ticker, side, qty, price))
+        except EconomyError as e:
+            return await send_embed(ctx, "danger", "Заявка отклонена", str(e))
+        buy = side == "buy"
+        fields = []
+        if r["filled"]:
+            fields += [("Исполнено", f"`{fmt(r['filled'])}` из `{fmt(qty)}`", True),
+                       ("Средняя цена", f"`{fmt_price(r['avg'])}`", True),
+                       ("Заплачено" if buy else "Получено (после сбора)",
+                        f"`{fmt(r['spent'] if buy else r['received'])}`", True)]
+            if not buy and r["fee"]:
+                fields.append(("Комиссия биржи", f"`{fmt(r['fee'])}`", True))
+            fields.append(("Котировка", f"`{fmt_price(r['quote'])}`", True))
+        if r["rest"]:
+            fields.append(("В книге заявок",
+                           f"`{fmt(r['rest']['left'])}` шт. по `{r['rest']['price']}` • id `{r['rest']['id']}`", False))
+        if r["cancelled"]:
+            fields.append(("Не исполнено", f"`{fmt(r['cancelled'])}` шт. — нет подходящих встречных заявок "
+                                           "или достигнут лимит исполнений за раз (остаток отменён, резерв возвращён)", False))
+        if r["refund"] and buy:
+            fields.append(("Возвращено из резерва", f"`{fmt(r['refund'])}`", True))
+        if not r["filled"] and r["rest"]:
+            title, kind = f"📋 Заявка размещена: {ticker}", "info"
+        elif not r["filled"]:
+            title, kind = f"Сделки не было: {ticker}", "warning"
+        else:
+            title, kind = (f"📈 Куплено: {ticker}" if buy else f"📉 Продано: {ticker}"), "success"
+        await send_embed(ctx, kind, title, fields=fields,
+                         footer="Лимитная заявка: !buy ТИКЕР кол-во ЦЕНА • отмена: !stock cancel")
+
+    @commands.hybrid_command(name="buy", description="Купить акции (без цены — по рынку, с ценой — лимитная заявка)")
+    @app_commands.describe(ticker="Тикер", amount="Количество акций", price="Лимитная цена (целая). Пусто — по рынку")
+    async def stock_buy(self, ctx, ticker: str, amount: int, price: Optional[int] = None):
         if ctx.guild is None:
             return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
         if not await self._require_module(ctx): return
+        await self._trade(ctx, "buy", ticker, str(amount), price)
+
+    @commands.hybrid_command(name="sell", description="Продать акции (без цены — по рынку, с ценой — лимитная заявка)")
+    @app_commands.describe(ticker="Тикер", amount="Количество или all", price="Лимитная цена (целая). Пусто — по рынку")
+    async def stock_sell(self, ctx, ticker: str, amount: str, price: Optional[int] = None):
+        if ctx.guild is None:
+            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
+        if not await self._require_module(ctx): return
+        await self._trade(ctx, "sell", ticker, amount, price)
+
+    @stock.command(name="cancel", description="Отменить заявку (id из !stock orders) или all")
+    @app_commands.describe(order="id заявки или all")
+    async def stock_cancel(self, ctx, order: str = "all"):
+        if not await self._require_module(ctx): return
         gid, uid = ctx.guild.id, ctx.author.id
-        holds = await self.bot.stock_holdings.find(
-            {"guild_id": gid, "user_id": uid, "shares": {"$gt": 0}}).to_list(500)
-        issued = await self.bot.stocks.find(
-            {"guild_id": gid, "owner_id": uid}).sort("created_at", 1).to_list(100)
-        tickers = [h["ticker"] for h in holds]
-        stocks = {}
-        if tickers:
-            async for d in self.bot.stocks.find({"guild_id": gid, "ticker": {"$in": tickers}}):
-                stocks[d["ticker"]] = d
-        bought, total = [], 0.0
+        short = None if order.strip().lower() in ("all", "все", "всё") else order.strip().lower()
+        try:
+            n, shares, cash = await self.bot.run_tx(lambda s: self._cancel_tx(s, gid, uid, short))
+        except EconomyError as e:
+            return await send_embed(ctx, "danger", "Отмена не удалась", str(e))
+        await send_embed(ctx, "success", "Заявки отменены",
+                         f"Отменено: `{n}`. Возвращено акций: `{fmt(shares)}`, денег: `{fmt(cash)}`.")
+
+    @stock.command(name="orders", description="Мои открытые заявки")
+    async def stock_orders_cmd(self, ctx):
+        if not await self._require_module(ctx): return
+        docs = await self.bot.stock_orders.find(
+            {"guild_id": ctx.guild.id, "user_id": ctx.author.id, "status": "open"}
+        ).sort("created_at", 1).to_list(50)
+        lines = [f"`{o['short']}` • {'🟢 покупка' if o['side'] == 'buy' else '🔴 продажа'} **{o['ticker']}**: "
+                 f"`{fmt(o['left'])}`/`{fmt(o['qty'])}` по `{o['price']}`" for o in docs]
+        await send_embed(ctx, "info", "📋 Мои заявки", fit_lines(lines, "Открытых заявок нет."),
+                         footer="Отмена: !stock cancel id|all")
+
+    @stock.command(name="book", description="Книга заявок по акции")
+    @app_commands.describe(ticker="Тикер")
+    async def stock_book(self, ctx, ticker: str):
+        if not await self._require_module(ctx): return
+        gid, ticker = ctx.guild.id, self._parse_ticker(ticker)
+        st = await self._get_stock(gid, ticker)
+        if not st:
+            return await send_embed(ctx, "danger", "Акция не найдена", f"Тикер `{ticker}` не существует.")
+
+        async def side_lines(side, order):
+            rows = await self.bot.stock_orders.aggregate([
+                {"$match": {"guild_id": gid, "ticker": ticker, "side": side, "status": "open", "left": {"$gt": 0}}},
+                {"$group": {"_id": "$price", "qty": {"$sum": "$left"}}},
+                {"$sort": {"_id": order}}, {"$limit": 7}]).to_list(7)
+            return [f"`{r['_id']}` × `{fmt(r['qty'])}`" for r in rows]
+        asks, bids = await side_lines("sell", 1), await side_lines("buy", -1)
+        lo, hi = self._band(st)
+        await send_embed(ctx, "info", f"📚 Книга заявок {ticker}",
+            fields=[("🔴 Продают (цена × кол-во)", "\n".join(asks) or "—", True),
+                    ("🟢 Покупают", "\n".join(bids) or "—", True),
+                    ("Котировка", f"`{fmt_price(st['price'])}`", True),
+                    ("Допустимые цены заявок", f"`{lo}` – `{hi}`", True)])
+
+    # ---------- капитал и дивиденды ----------
+    @stock.command(name="invest", description="Внести деньги в капитал своей компании")
+    @app_commands.describe(ticker="Тикер", amount="Сумма")
+    async def stock_invest(self, ctx, ticker: str, amount: int):
+        if not await self._require_module(ctx): return
+        gid, uid, ticker = ctx.guild.id, ctx.author.id, self._parse_ticker(ticker)
+        if amount <= 0:
+            return await send_embed(ctx, "danger", "Ошибка", "Сумма должна быть положительной.")
+
+        async def _txn(session):
+            st = await self.bot.stocks.find_one({"_id": stock_sid(gid, ticker), "guild_id": gid}, session=session)
+            if not st or int(st["owner_id"]) != uid:
+                raise EconomyError("Вносить капитал может только основатель компании.")
+            if not await self.bot.change_cash(gid, uid, -amount, session=session):
+                raise EconomyError("Недостаточно наличных.")
+            await self.bot.stocks.update_one({"_id": st["_id"], "guild_id": gid},
+                {"$inc": {"treasury": amount}, "$set": {"updated_at": now()}}, session=session)
+            await self.bot.journal(f"user_{uid}", f"company_{ticker}", amount, f"Взнос в капитал {ticker}",
+                                   {"type": "stock_capital"}, session=session, guild_id=gid)
+        try:
+            await self.bot.run_tx(_txn)
+        except EconomyError as e:
+            return await send_embed(ctx, "danger", "Взнос отклонён", str(e))
+        await send_embed(ctx, "success", f"💼 Капитал {ticker} пополнен",
+            f"В казну компании внесено `{fmt(amount)}`. Это капитал, а не прибыль: "
+            "на дивиденды идёт только прибыль от биржевых комиссий.")
+
+    @stock.command(name="dividend", description="Какая доля прибыли выплачивается дивидендами (0–100%)")
+    @app_commands.describe(ticker="Тикер", percent="Процент прибыли на дивиденды, например 50")
+    async def stock_dividend(self, ctx, ticker: str, percent: str):
+        if not await self._require_module(ctx): return
+        gid, uid, ticker = ctx.guild.id, ctx.author.id, self._parse_ticker(ticker)
+        try:
+            value = float(str(percent).replace("%", "").replace(",", ".").strip())
+        except ValueError:
+            return await send_embed(ctx, "danger", "Ошибка", "Укажи число от 0 до 100.")
+        if not 0 <= value <= 100:
+            return await send_embed(ctx, "danger", "Ошибка", "Процент должен быть от 0 до 100.")
+        res = await self.bot.stocks.update_one(
+            {"_id": stock_sid(gid, ticker), "guild_id": gid, "owner_id": uid},
+            {"$set": {"payout_ratio": value / 100, "updated_at": now()}})
+        if res.matched_count != 1:
+            return await send_embed(ctx, "danger", "Нельзя изменить", "Это может сделать только основатель компании.")
+        await send_embed(ctx, "success", f"Дивидендная политика {ticker}",
+                         f"На дивиденды будет направляться `{value:g}%` накопленной прибыли "
+                         f"(выплата раз в {STOCK_DIVIDEND_HOURS} ч, всем акционерам пропорционально акциям).")
+
+    # ---------- мои акции ----------
+    @stock.command(name="my", description="Мой портфель, заявки и дивиденды")
+    async def stock_my(self, ctx):
+        if not await self._require_module(ctx): return
+        gid, uid = ctx.guild.id, ctx.author.id
+        holds = await self.bot.stock_holdings.find({"guild_id": gid, "user_id": uid, "shares": {"$gt": 0}}).to_list(500)
+        orders = await self.bot.stock_orders.find({"guild_id": gid, "user_id": uid, "status": "open"}).to_list(100)
+        issued = await self.bot.stocks.find({"guild_id": gid, "owner_id": uid}).sort("created_at", 1).to_list(100)
+        shares, escrow_cash = {}, 0
         for h in holds:
-            st = stocks.get(h["ticker"])
-            if not st or int(st["owner_id"]) == uid:     # свои выпущенные акции — не «купленные»
+            shares[h["ticker"]] = shares.get(h["ticker"], 0) + int(h["shares"])
+        for o in orders:
+            if o["side"] == "sell":
+                shares[o["ticker"]] = shares.get(o["ticker"], 0) + int(o["left"])
+            else:
+                escrow_cash += int(o["escrow"])
+        stocks = {}
+        if shares:
+            async for d in self.bot.stocks.find({"guild_id": gid, "ticker": {"$in": list(shares)}}):
+                stocks[d["ticker"]] = d
+        rows, total = [], 0.0
+        for t, n in shares.items():
+            st = stocks.get(t)
+            if not st:
                 continue
-            shares = int(h["shares"])
-            value = shares * float(st["price"])
+            value = n * float(st["price"])
             total += value
-            bought.append((value, f"**{st['ticker']}** — {st['name']}: `{fmt(shares)}` шт. ≈ `{fmt(value)}`"))
-        bought.sort(key=lambda x: x[0], reverse=True)
-        bought_lines = [line for _v, line in bought]
-        issued_lines = [f"**{d['ticker']}** — {d['name']}" for d in issued]
-        fields = [("Купленные акции", fit_lines(bought_lines, "Пока ничего не куплено."), False)]
-        if bought_lines:
+            pct = n / max(1, int(st["supply"])) * 100
+            rows.append((value, f"**{t}** — {st['name']}: `{fmt(n)}` шт. ({pct:.1f}%) ≈ `{fmt(value)}`"))
+        rows.sort(key=lambda x: x[0], reverse=True)
+        div = await self.bot.stock_payouts.aggregate([
+            {"$match": {"guild_id": gid, "user_id": uid}},
+            {"$group": {"_id": None, "net": {"$sum": "$net"}, "d30": {"$sum": {"$cond": [
+                {"$gte": ["$at", now() - timedelta(days=30)]}, "$net", 0]}}}}]).to_list(1)
+        net_all, net_30 = (int(div[0]["net"]), int(div[0]["d30"])) if div else (0, 0)
+        fields = [("Портфель", fit_lines([l for _v, l in rows], "Акций пока нет."), False)]
+        if rows:
             fields.append(("Стоимость портфеля", f"`{fmt(total)}`", True))
-        fields.append(("Выпущенные компании", fit_lines(issued_lines, "Ты не выпускал акции."), False))
-        await send_embed(ctx, "info", "📈 Мои акции", fields=fields,
-                         footer=f"Сервер: {ctx.guild.name}",
+        fields += [("Дивиденды (всего / 30 дн.)", f"`{fmt(net_all)}` / `{fmt(net_30)}`", True),
+                   ("Открытых заявок", f"`{len(orders)}` (заморожено `{fmt(escrow_cash)}`)", True),
+                   ("Выпущенные компании", fit_lines([f"**{d['ticker']}** — {d['name']}" for d in issued],
+                                                      "Ты не выпускал акции."), False)]
+        await send_embed(ctx, "info", "📈 Мои акции", fields=fields, footer=f"Сервер: {ctx.guild.name}",
                          thumbnail=ctx.author.display_avatar.url)
 
-    # ---------- торговля ----------
-    @commands.hybrid_command(name="buy", description="Купить акции")
-    @app_commands.describe(ticker="Тикер", amount="Количество акций")
-    async def stock_buy(self, ctx, ticker: str, amount: int):
-        if ctx.guild is None:
-            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
-        if not await self._require_module(ctx): return
-        gid, uid = ctx.guild.id, ctx.author.id
-        ticker = self._parse_ticker(ticker)
-        if amount <= 0 or amount > 1_000_000:
-            return await send_embed(ctx, "danger", "Ошибка", "Количество должно быть положительным.")
-        left = self._throttle(gid, uid)
-        if left > 0:
-            return await send_embed(ctx, "warning", "Не так быстро",
-                                    f"Следующая сделка через **{fmt_duration(left)}**.")
-        sid = stock_sid(gid, ticker)
-        try:
-            cost = None
-            new_price = None
-            st = None
-            async def _txn(session):
-                nonlocal cost, new_price, st
-                st = await self.bot.stocks.find_one({"_id": sid, "guild_id": gid}, session=session)
-                if not st:
-                    raise EconomyError(f"Акция `{ticker}` не найдена.")
-                owner = int(st["owner_id"])
-                if owner == uid:
-                    raise EconomyError("Нельзя торговать акциями собственной компании.")
-                held = await self.bot.stock_holdings.find_one(hkey(gid, owner, ticker), session=session)
-                available = int((held or {}).get("shares", 0))
-                if amount > available:
-                    raise EconomyError(f"У эмитента в продаже только `{fmt(available)}` акций.")
-                # Покупка поднимает цену на 1%; исполняем по цене ПОСЛЕ сдвига,
-                # поэтому цикл «купил-продал» никогда не даёт прибыли.
-                new_price = max(1.0, round(float(st["price"]) * (1 + STOCK_TRADE_STEP), 2))
-                cost = math.ceil(new_price * amount)
-                upd = await self.bot.stocks.update_one(
-                    {"_id": sid, "guild_id": gid, "price": st["price"]},
-                    {"$set": {"price": new_price, "updated_at": now()}}, session=session)
-                if upd.modified_count != 1:
-                    raise EconomyError("Цена изменилась во время сделки. Повтори команду.")
-                await self.bot.ensure_user(gid, owner, session=session)
-                paid = await self.bot.db_users.update_one(
-                    {**ukey(gid, uid), "cash": {"$gte": cost}},
-                    {"$inc": {"cash": -cost}, "$set": {"updated_at": now()}}, session=session)
-                if paid.modified_count != 1:
-                    raise EconomyError(f"Недостаточно наличных. Нужно `{fmt(cost)}`.")
-                # деньги идут владельцу акции
-                await self.bot.db_users.update_one(
-                    ukey(gid, owner),
-                    {"$inc": {"cash": cost}, "$set": {"updated_at": now()}}, session=session)
-                took = await self.bot.stock_holdings.update_one(
-                    {**hkey(gid, owner, ticker), "shares": {"$gte": amount}},
-                    {"$inc": {"shares": -amount}, "$set": {"updated_at": now()}}, session=session)
-                if took.modified_count != 1:
-                    raise EconomyError("Акции эмитента уже раскуплены.")
-                await self.bot.stock_holdings.update_one(
-                    hkey(gid, uid, ticker),
-                    {"$inc": {"shares": amount}, "$set": {"updated_at": now()}},
-                    upsert=True, session=session)
-                await self.bot.journal(f"user_{uid}", f"user_{owner}", cost,
-                                       f"Покупка акций {ticker}",
-                                       {"type": "stock_buy", "ticker": ticker,
-                                        "shares": amount, "price": new_price},
-                                       session=session, guild_id=gid)
-            await self.bot.run_tx(_txn)
-        except EconomyError as e:
-            return await send_embed(ctx, "danger", "Покупка не удалась", str(e))
-        await send_embed(ctx, "success", f"📈 Куплено: {ticker}",
-            fields=[("Акций", f"`{fmt(amount)}`", True),
-                    ("Цена за акцию", f"`{fmt_price(new_price)}`", True),
-                    ("Итого", f"`{fmt(cost)}`", True)],
-            footer=f"Деньги получил владелец: {st['name']}")
-
-    @commands.hybrid_command(name="sell", description="Продать акции")
-    @app_commands.describe(ticker="Тикер", amount="Количество или all")
-    async def stock_sell(self, ctx, ticker: str, amount: str):
-        if ctx.guild is None:
-            return await send_embed(ctx, "danger", "Ошибка", "Команда доступна только на сервере.")
-        if not await self._require_module(ctx): return
-        gid, uid = ctx.guild.id, ctx.author.id
-        ticker = self._parse_ticker(ticker)
-        mine = await self.bot.stock_holdings.find_one(hkey(gid, uid, ticker))
-        qty = parse_amount(amount, int((mine or {}).get("shares", 0)))
-        if not qty:
-            return await send_embed(ctx, "danger", "Ошибка",
-                                    "Укажи положительное количество акций или `all`.")
-        left = self._throttle(gid, uid)
-        if left > 0:
-            return await send_embed(ctx, "warning", "Не так быстро",
-                                    f"Следующая сделка через **{fmt_duration(left)}**.")
-        sid = stock_sid(gid, ticker)
-        try:
-            new_price = None
-            proceeds = None
-            async def _txn(session):
-                nonlocal new_price, proceeds
-                st = await self.bot.stocks.find_one({"_id": sid, "guild_id": gid}, session=session)
-                if not st:
-                    raise EconomyError(f"Акция `{ticker}` не найдена.")
-                owner = int(st["owner_id"])
-                if owner == uid:
-                    raise EconomyError("Нельзя торговать акциями собственной компании.")
-                # Продажа понижает цену на 1% (не ниже 1); исполняем по цене после сдвига.
-                new_price = max(1.0, round(float(st["price"]) * (1 - STOCK_TRADE_STEP), 2))
-                proceeds = max(1, math.floor(new_price * qty))
-                upd = await self.bot.stocks.update_one(
-                    {"_id": sid, "guild_id": gid, "price": st["price"]},
-                    {"$set": {"price": new_price, "updated_at": now()}}, session=session)
-                if upd.modified_count != 1:
-                    raise EconomyError("Цена изменилась во время сделки. Повтори команду.")
-                await self.bot.ensure_user(gid, owner, session=session)
-                taken = await self.bot.stock_holdings.update_one(
-                    {**hkey(gid, uid, ticker), "shares": {"$gte": qty}},
-                    {"$inc": {"shares": -qty}, "$set": {"updated_at": now()}}, session=session)
-                if taken.modified_count != 1:
-                    raise EconomyError("У тебя недостаточно акций.")
-                # Выкупает эмитент: платит из своих наличных, акции возвращаются к нему.
-                paid = await self.bot.db_users.update_one(
-                    {**ukey(gid, owner), "cash": {"$gte": proceeds}},
-                    {"$inc": {"cash": -proceeds}, "$set": {"updated_at": now()}}, session=session)
-                if paid.modified_count != 1:
-                    raise EconomyError("У эмитента недостаточно наличных для выкупа.")
-                await self.bot.ensure_user(gid, uid, session=session)
-                await self.bot.db_users.update_one(
-                    ukey(gid, uid),
-                    {"$inc": {"cash": proceeds}, "$set": {"updated_at": now()}}, session=session)
-                await self.bot.stock_holdings.update_one(
-                    hkey(gid, owner, ticker),
-                    {"$inc": {"shares": qty}, "$set": {"updated_at": now()}},
-                    upsert=True, session=session)
-                await self.bot.journal(f"user_{owner}", f"user_{uid}", proceeds,
-                                       f"Продажа акций {ticker}",
-                                       {"type": "stock_sell", "ticker": ticker,
-                                        "shares": qty, "price": new_price},
-                                       session=session, guild_id=gid)
-            await self.bot.run_tx(_txn)
-        except EconomyError as e:
-            return await send_embed(ctx, "danger", "Продажа не удалась", str(e))
-        await send_embed(ctx, "success", f"📉 Продано: {ticker}",
-            fields=[("Акций", f"`{fmt(qty)}`", True),
-                    ("Цена за акцию", f"`{fmt_price(new_price)}`", True),
-                    ("Получено", f"`{fmt(proceeds)}`", True)])
+    # ---------- проверка целостности ----------
+    @stock.command(name="audit", description="Проверка учёта акций и денег (администратор)")
+    @commands.has_permissions(administrator=True)
+    async def stock_audit(self, ctx):
+        gid = ctx.guild.id
+        problems, checked = [], 0
+        async for st in self.bot.stocks.find({"guild_id": gid}):
+            checked += 1
+            t = st["ticker"]
+            held = sum([int(h["shares"]) async for h in self.bot.stock_holdings.find({"guild_id": gid, "ticker": t})])
+            listed = sum([int(o["left"]) async for o in self.bot.stock_orders.find(
+                {"guild_id": gid, "ticker": t, "side": "sell", "status": "open"})])
+            if held + listed != int(st["supply"]):
+                problems.append(f"**{t}**: акций {fmt(held + listed)} ≠ выпущено {fmt(st['supply'])}")
+            if int(st.get("profit_pool", 0)) > int(st.get("treasury", 0)):
+                problems.append(f"**{t}**: прибыль {fmt(st['profit_pool'])} > казна {fmt(st['treasury'])}")
+            if int(st.get("treasury", 0)) < 0:
+                problems.append(f"**{t}**: отрицательная казна")
+        neg = await self.bot.stock_holdings.count_documents({"guild_id": gid, "shares": {"$lt": 0}})
+        if neg:
+            problems.append(f"Отрицательных позиций: {neg}")
+        if problems:
+            return await send_embed(ctx, "danger", "Аудит биржи: найдены расхождения", fit_lines(problems, "—"))
+        await send_embed(ctx, "success", "Аудит биржи: всё сходится", f"Проверено компаний: `{checked}`.")
 
     # ---------- профиль и графики ----------
-    @stock.command(name="info", description="Профиль акции и графики")
+    @stock.command(name="info", description="Профиль акции, финансы и графики")
     @app_commands.describe(ticker="Тикер")
     async def stock_info(self, ctx, ticker: str):
         if not await self._require_module(ctx): return
@@ -3363,21 +4167,50 @@ class StockCog(commands.Cog):
         st = await self._get_stock(gid, ticker)
         if not st:
             return None
-        price = float(st["price"])
+        price, supply = float(st["price"]), max(1, int(st.get("supply", 0)))
         rows = stock_rows(st)
         change = stock_change_24h(rows, price)
-        cap = price * int(st.get("supply", 0))
-        mine = await self.bot.stock_holdings.find_one(hkey(gid, uid, ticker))
+        treasury = int(st.get("treasury", 0))
+        profit7 = await self._profit_days(gid, ticker, 7)
+        fair = fair_value(treasury, supply, profit7)
+        company_sh = await self._company_shares(gid, ticker)
+        outstanding = max(1, supply - company_sh)
+        since = now() - timedelta(hours=24)
+        vol = await self.bot.stock_trades.aggregate([
+            {"$match": {"guild_id": gid, "ticker": ticker, "at": {"$gte": since}}},
+            {"$group": {"_id": None, "q": {"$sum": "$qty"}}}]).to_list(1)
+        div30 = await self.bot.stock_dividends.aggregate([
+            {"$match": {"guild_id": gid, "ticker": ticker, "at": {"$gte": now() - timedelta(days=30)}}},
+            {"$group": {"_id": None, "t": {"$sum": "$total"}}}]).to_list(1)
+        div30_ps = (int(div30[0]["t"]) / outstanding) if div30 else 0.0
+        best_ask = await self.bot.stock_orders.find_one(
+            {"guild_id": gid, "ticker": ticker, "side": "sell", "status": "open", "left": {"$gt": 0}},
+            sort=[("price", 1)])
+        best_bid = await self.bot.stock_orders.find_one(
+            {"guild_id": gid, "ticker": ticker, "side": "buy", "status": "open", "left": {"$gt": 0}},
+            sort=[("price", -1)])
+        held = await self.bot.stock_holdings.find_one(hkey(gid, uid, ticker))
+        listed = sum([int(o["left"]) async for o in self.bot.stock_orders.find(
+            {"guild_id": gid, "ticker": ticker, "user_id": uid, "side": "sell", "status": "open"})])
         color = (discord.Color.green() if change > 0
                  else discord.Color.red() if change < 0 else discord.Color.blurple())
-        e24 = make_embed("info", f"{ticker} — {st['name']}",
-            fields=[("Цена", f"`{fmt_price(price)}`", True),
-                    ("За 24ч", f"`{change:+.2f}%`", True),
-                    ("Капитализация", f"`{fmt(cap)}`", True),
-                    ("Владелец", f"<@{int(st['owner_id'])}>", True),
-                    ("Всего акций", f"`{fmt(st.get('supply', 0))}`", True),
-                    ("У тебя", f"`{fmt((mine or {}).get('shares', 0))}`", True)],
-            footer=f"Сервер: {guild_name}")
+        fields = [("Цена", f"`{fmt_price(price)}`", True),
+                  ("За 24ч", f"`{change:+.2f}%`", True),
+                  ("Капитализация", f"`{fmt(price * supply)}`", True),
+                  ("Основатель", f"<@{int(st['owner_id'])}>", True),
+                  ("Выпущено / в обращении", f"`{fmt(supply)}` / `{fmt(outstanding)}`", True),
+                  ("У тебя", f"`{fmt(int((held or {}).get('shares', 0)) + listed)}`", True),
+                  ("Покупка / продажа", f"`{best_bid['price'] if best_bid else '—'}` / "
+                                        f"`{best_ask['price'] if best_ask else '—'}`", True),
+                  ("Объём 24ч", f"`{fmt(vol[0]['q']) if vol else 0}` шт.", True),
+                  ("Казна компании", f"`{fmt(treasury)}`", True),
+                  ("Нераспределённая прибыль", f"`{fmt(st.get('profit_pool', 0))}`", True),
+                  ("Прибыль за 7 дн.", f"`{fmt(profit7)}`", True),
+                  ("Дивиденд (30 дн.) на акцию",
+                   f"`{div30_ps:.3f}` ({div30_ps / price * 100:.2f}% к цене)" if price else "—", True),
+                  ("Выплата прибыли", f"`{float(st.get('payout_ratio', STOCK_DEFAULT_PAYOUT)) * 100:g}%`", True),
+                  ("Справедливая цена", f"`{fmt_price(fair)}`" if fair else "—", True)]
+        e24 = make_embed("info", f"{ticker} — {st['name']}", fields=fields, footer=f"Сервер: {guild_name}")
         e24.title = f"{'📈' if change >= 0 else '📉'} {ticker} — {st['name']}"
         e24.color = color
         cutoff = now() - timedelta(hours=24)
@@ -3435,6 +4268,12 @@ def settings_embed(guild, cfg):
         inline=False,
     )
     embed.add_field(
+        name="Награды !crime / !slut",
+        value=(f"`!crime`: {fmt(cfg['crime_min'])}–{fmt(cfg['crime_max'])}\n"
+               f"`!slut`: {fmt(cfg['slut_min'])}–{fmt(cfg['slut_max'])}"),
+        inline=False,
+    )
+    embed.add_field(
         name="Кредит",
         value=(f"Процент: {fmt_pct(cfg['loan_interest'])} • "
                f"штраф просрочки: {fmt_pct(cfg['loan_penalty'])} в сутки"),
@@ -3468,7 +4307,7 @@ class PresetSelect(discord.ui.Select):
                 description=preset["description"][:100], default=(key == current)))
         options.append(discord.SelectOption(
             label="Кастомная", value="custom", emoji="⚙️",
-            description="Ввести шансы, налоги и кулдауны вручную", default=(current == "custom")))
+            description="Ввести шансы, налоги, кулдауны и награды вручную", default=(current == "custom")))
         super().__init__(placeholder="Выбери пресет экономики", min_values=1, max_values=1,
                          options=options, row=0)
 
@@ -3649,8 +4488,7 @@ class SettingsModal(discord.ui.Modal):
                 errors.append(f"• **{SETTING_SPECS[key][3]}**: {e}")
         gid = self.panel.guild.id
         merged = {**await self.panel.bot.get_settings(gid), **values}
-        if merged["work_min"] > merged["work_max"]:
-            errors.append("• **Зарплата !work**: минимум больше максимума")
+        errors += reward_range_errors(merged, set(values))
         if errors:
             return await reply_ephemeral(interaction, "❌ Не сохранено:\n" + "\n".join(errors))
         update = {"$set": {**{f"eco.{key}": value for key, value in values.items()},
